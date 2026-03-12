@@ -191,6 +191,7 @@ def _ss_entry_to_paper(entry: dict, arxiv_id: str = "") -> dict:
         "categories":              _ss_fields_to_categories(entry.get("s2FieldsOfStudy")),
         "references": [
             {
+                "paperId": r.get("paperId") or "",
                 "title":   r.get("title") or "",
                 "authors": [
                     {"name": a.get("name", ""), "authorId": a.get("authorId") or ""}
@@ -346,7 +347,7 @@ load_seed_ids = load_seed_urls
 _SEED_FIELDS = (
     "paperId,externalIds,title,abstract,publicationDate,"
     "s2FieldsOfStudy,authors,"
-    "references.title,references.authors,"
+    "references.paperId,references.title,references.authors,"
     "citationCount,influentialCitationCount"
 )
 

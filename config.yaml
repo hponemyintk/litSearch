@@ -15,15 +15,15 @@ keywords:
 
 scoring:
   max_semantic: 35
-  max_seed_ref_author: 10
+  max_seed_ref_author: 7
   seed_ref_per_author: 4
-  max_cites_seed: 15
+  max_cites_seed: 10
   cites_seed_per_seed: 5
-  max_authority: 9
-  max_citation_vel: 12
+  flat_ref_by_seed: 5
+  max_authority: 10
+  max_citation_vel: 18
   flat_institution: 5
-  flat_cross_cat: 5
-  max_benchmark: 9
+  max_benchmark: 10
 
 institutions:
   # US universities

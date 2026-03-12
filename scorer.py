@@ -5,17 +5,17 @@ Scores a paper using 8 heuristics (point values configurable via config.yaml):
 
   Relevance:
     1. Semantic Similarity          — embedding cosine sim to seeds      (35)
-    2. Author in Seed Refs          — candidate authorId in seed refs    (10)
-    3. Cites Seed                   — paper directly cites seed papers   (15)
+    2. Author in Seed Refs          — candidate authorId in seed refs    (7)
+    3. Cites Seed                   — paper directly cites seed papers   (8)
+    4. Referenced by Seed           — paper appears in seed references   (5)
 
   Quality:
-    4. Author Authority             — logarithmic h-index               (9)
-    5. Citation Velocity            — citations/day + recency prior      (12)
+    5. Author Authority             — logarithmic h-index               (10)
+    6. Citation Velocity            — citations/day + recency prior      (20)
 
   Bonuses:
-    6. Institutional Authority      — affiliation check                  (5)
-    7. Category Intersection        — dynamic seed-category overlap      (5)
-    8. Benchmark Specificity        — dataset names in abstract          (9)
+    7. Institutional Authority      — affiliation check                  (5)
+    8. Benchmark Specificity        — dataset names in abstract          (10)
 
 Call build_scoring_config(seed_papers, window_hours) once per session,
 then precompute_similarities(candidates, config) before scoring,
@@ -43,15 +43,15 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_SCORING = {
     "max_semantic": 35,
-    "max_seed_ref_author": 10,
+    "max_seed_ref_author": 7,
     "seed_ref_per_author": 4,
-    "max_cites_seed": 15,
-    "cites_seed_per_seed": 5,
-    "max_authority": 9,
-    "max_citation_vel": 12,
+    "max_cites_seed": 8,
+    "cites_seed_per_seed": 4,
+    "flat_ref_by_seed": 5,
+    "max_authority": 10,
+    "max_citation_vel": 20,
     "flat_institution": 5,
-    "flat_cross_cat": 5,
-    "max_benchmark": 9,
+    "max_benchmark": 10,
 }
 
 _DEFAULT_INSTITUTIONS: list[str] = [
@@ -200,16 +200,8 @@ def build_scoring_config(
     # Compute max total dynamically from scoring constants
     max_total = (
         sc["max_semantic"] + sc["max_seed_ref_author"] + sc["max_cites_seed"]
-        + sc["max_authority"] + sc["max_citation_vel"]
-        + sc["flat_institution"] + sc["flat_cross_cat"] + sc["max_benchmark"]
-    )
-
-    # Extract distinct category groups from seeds for dynamic intersection
-    seed_cat_groups = _extract_seed_category_groups(seed_papers)
-    log.info(
-        "Category groups from seeds: %d distinct (%s)",
-        len(seed_cat_groups),
-        ", ".join(str(g) for g in seed_cat_groups),
+        + sc["flat_ref_by_seed"] + sc["max_authority"] + sc["max_citation_vel"]
+        + sc["flat_institution"] + sc["max_benchmark"]
     )
 
     return {
@@ -218,10 +210,9 @@ def build_scoring_config(
         "_seed_embeddings":  seed_embeddings,
         "_sim_threshold":    sim_threshold,
         "_institution_re":   _build_institution_pattern(institutions),
-        # author matching (by authorId)
+        # author matching (by authorId) + paper matching (by paperId)
         "seed_ref_author_ids": _extract_seed_ref_author_ids(seed_papers),
-        # category intersection (dynamic)
-        "_seed_category_groups": seed_cat_groups,
+        "seed_ref_paper_ids":  _extract_seed_ref_paper_ids(seed_papers),
         # window
         "window_hours":      window_hours,
         # scoring constants (from config.yaml with defaults)
@@ -246,25 +237,16 @@ def _extract_seed_ref_author_ids(seed_papers: list[dict]) -> set[str]:
     return ids
 
 
-def _extract_seed_category_groups(seed_papers: list[dict]) -> list[set[str]]:
-    """
-    Extract distinct category sets from seed papers.
+def _extract_seed_ref_paper_ids(seed_papers: list[dict]) -> set[str]:
+    """Collect unique paperIds from all seed papers' reference lists."""
+    ids: set[str] = set()
+    for paper in seed_papers:
+        for ref in (paper.get("references") or []):
+            pid = (ref.get("paperId") or "").strip()
+            if pid:
+                ids.add(pid)
+    return ids
 
-    Each seed contributes its set of arXiv-like categories.
-    Duplicate category sets are collapsed so that e.g. four seeds all tagged
-    {cs.LG, cs.AI} count as one group, not four.
-
-    Used by score_category_intersection to reward candidates that bridge
-    2+ distinct seed category groups.
-    """
-    groups: list[set[str]] = []
-    seen: set[frozenset[str]] = set()
-    for p in seed_papers:
-        cats = frozenset(p.get("categories") or [])
-        if cats and cats not in seen:
-            seen.add(cats)
-            groups.append(set(cats))
-    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +386,25 @@ def score_cites_seed(paper: dict[str, Any], config: dict[str, Any]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Heuristic 4: Author Authority (logarithmic h-index)
+# Heuristic 4: Referenced by Seed (candidate appears in seed references)
+# ---------------------------------------------------------------------------
+
+def score_referenced_by_seed(paper: dict[str, Any], config: dict[str, Any]) -> int:
+    """
+    Flat points if this paper's SS paperId appears in any seed paper's
+    reference list (i.e. a seed paper cites this candidate).
+    """
+    seed_ref_pids = config.get("seed_ref_paper_ids") or set()
+    if not seed_ref_pids:
+        return 0
+    pid = (paper.get("ss_id") or "").strip()
+    if pid and pid in seed_ref_pids:
+        return config.get("flat_ref_by_seed", _DEFAULT_SCORING["flat_ref_by_seed"])
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Heuristic 5: Author Authority (logarithmic h-index)
 # ---------------------------------------------------------------------------
 
 def score_author_authority(
@@ -425,7 +425,7 @@ def score_author_authority(
 
 
 # ---------------------------------------------------------------------------
-# Heuristic 5: Citation Velocity (with window-scaled recency prior)
+# Heuristic 6: Citation Velocity (with window-scaled recency prior)
 # ---------------------------------------------------------------------------
 
 def score_citation_velocity(
@@ -437,17 +437,17 @@ def score_citation_velocity(
     Combines citation velocity with a recency prior scaled to the
     lookback window.
 
-    Recency prior (benefit of the doubt for new papers):
-      < 15% of window  ->  base 5 pts
-      < 35% of window  ->  base 3 pts
-      >= 35%            ->  base 0 pts (must earn via citations)
+    Recency prior (proportional to max_pts):
+      < 15% of window  ->  base 50% of max_pts
+      < 35% of window  ->  base 30% of max_pts
+      >= 35%            ->  base 0 (must earn via citations)
 
-    Citation velocity bins (effective citations/day):
-      >= 5.0 -> 10    >= 0.5 -> 4
-      >= 2.0 -> 8     >= 0.2 -> 3
-      >= 1.0 -> 6     >= 0.1 -> 2
+    Citation velocity bins (proportional to max_pts):
+      >= 5.0 -> 100%    >= 0.5 -> 40%
+      >= 2.0 -> 80%     >= 0.2 -> 30%
+      >= 1.0 -> 60%     >= 0.1 -> 20%
 
-    Final score = max(base, velocity_score), capped.
+    Final score = max(base, velocity_score), capped at max_pts.
     Influential citations count 3x (2x bonus on top of base count).
     """
     published   = paper.get("published") or ""
@@ -478,34 +478,34 @@ def score_citation_velocity(
     mid_cutoff = window_days * 0.35
 
     if age_days < fresh_cutoff:
-        base = 5
+        base = round(max_pts * 0.50)
     elif age_days < mid_cutoff:
-        base = 3
+        base = round(max_pts * 0.30)
     else:
         base = 0
 
-    # Citation velocity
+    # Citation velocity (bins scale with max_pts)
     vel_score = 0
     if age_days >= 1 and effective > 0:
         velocity = effective / age_days
         if velocity >= 5.0:
-            vel_score = 10
+            vel_score = max_pts
         elif velocity >= 2.0:
-            vel_score = 8
+            vel_score = round(max_pts * 0.80)
         elif velocity >= 1.0:
-            vel_score = 6
+            vel_score = round(max_pts * 0.60)
         elif velocity >= 0.5:
-            vel_score = 4
+            vel_score = round(max_pts * 0.40)
         elif velocity >= 0.2:
-            vel_score = 3
+            vel_score = round(max_pts * 0.30)
         elif velocity >= 0.1:
-            vel_score = 2
+            vel_score = round(max_pts * 0.20)
 
     return min(max(base, vel_score), max_pts)
 
 
 # ---------------------------------------------------------------------------
-# Heuristic 6: Institutional Authority (word-boundary matching)
+# Heuristic 7: Institutional Authority (word-boundary matching)
 # ---------------------------------------------------------------------------
 
 def score_institutional_authority(
@@ -525,33 +525,6 @@ def score_institutional_authority(
         if pattern.search(affil_str):
             return flat_pts
     return 0
-
-
-# ---------------------------------------------------------------------------
-# Heuristic 7: Category Intersection (dynamic seed-category overlap)
-# ---------------------------------------------------------------------------
-
-def score_category_intersection(
-    categories: list[str],
-    config: dict[str, Any],
-) -> int:
-    """
-    Award points if the paper's categories overlap with 2+ distinct
-    seed-paper category groups (i.e. it bridges multiple research areas
-    represented by the seeds).
-
-    Category groups are extracted from seed papers at config time and
-    deduplicated, so identical seeds don't inflate the count.
-    """
-    seed_groups = config.get("_seed_category_groups", [])
-    if len(seed_groups) < 2 or not categories:
-        return 0
-    max_pts = config.get("flat_cross_cat", _DEFAULT_SCORING["flat_cross_cat"])
-    cat_set = set(categories)
-    groups_hit = sum(1 for group in seed_groups if cat_set & group)
-    if groups_hit < 2:
-        return 0
-    return max_pts
 
 
 # ---------------------------------------------------------------------------
@@ -583,24 +556,23 @@ def score_paper(paper: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]
     """
     authors    = paper.get("authors") or []
     abstract   = paper.get("abstract") or ""
-    categories = paper.get("categories") or []
     max_total  = config.get("max_total", 100)
 
     sem   = score_semantic_similarity(paper, config)
     sref  = score_author_in_seed_refs(authors, config)
     cseed = score_cites_seed(paper, config)
+    rbs   = score_referenced_by_seed(paper, config)
     auth  = score_author_authority(authors, config)
     vel   = score_citation_velocity(paper, config)
     inst  = score_institutional_authority(authors, config)
-    cat   = score_category_intersection(categories, config)
     bench = score_benchmark_specificity(abstract, config)
 
-    total = min(sem + sref + cseed + auth + vel + inst + cat + bench, max_total)
+    total = min(sem + sref + cseed + rbs + auth + vel + inst + bench, max_total)
 
     summary = (
         f"Total: {total}/{max_total} | "
-        f"Sem: {sem}, SRef: {sref}, Cite: {cseed}, Auth: {auth}, "
-        f"Vel: {vel}, Inst: {inst}, Cat: {cat}, Bench: {bench}"
+        f"Sem: {sem}, SRef: {sref}, Cite: {cseed}, RefBy: {rbs}, Auth: {auth}, "
+        f"Vel: {vel}, Inst: {inst}, Bench: {bench}"
     )
 
     result = copy.copy(paper)
@@ -610,10 +582,10 @@ def score_paper(paper: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]
         "semantic":      sem,
         "seed_ref":      sref,
         "cites_seed":    cseed,
+        "ref_by_seed":   rbs,
         "authority":     auth,
         "velocity":      vel,
         "institution":   inst,
-        "cross_cat":     cat,
         "benchmark":     bench,
         "summary":       summary,
     }
