@@ -1,14 +1,104 @@
-keyword_weights:
-  relational foundation model: 5
-  relational transformer: 5
-  tabular foundation model: 5
-  tabular transformer: 5
-  tabpfn: 5
-  relational deep learning: 3
-  graph transformer: 3
-  synthetic data: 3
-  transformer: 2
-  in-context learning: 2
-  heterogeneous graph: 2
-  message passing: 2
-  relational: 2
+keywords:
+  - relational foundation model
+  - relational transformer
+  - tabular foundation model
+  - tabular transformer
+  - tabpfn
+  - relational deep learning
+  - graph transformer
+  - synthetic data
+  - transformer
+  - in-context learning
+  - heterogeneous graph
+  - message passing
+  - relational
+
+scoring:
+  max_semantic: 35
+  max_seed_ref_author: 10
+  seed_ref_per_author: 4
+  max_cites_seed: 15
+  cites_seed_per_seed: 5
+  max_authority: 9
+  max_citation_vel: 12
+  flat_institution: 5
+  flat_cross_cat: 5
+  max_benchmark: 9
+
+institutions:
+  # US universities
+  - Stanford
+  - MIT
+  - Berkeley
+  - Carnegie Mellon
+  - CMU
+  - Princeton
+  - Harvard
+  - Cornell
+  - Yale
+  - Columbia
+  - University of Washington
+  - Georgia Tech
+  - UCLA
+  - NYU
+  - University of Michigan
+  - UIUC
+  - University of Illinois
+  - Caltech
+  # European universities
+  - Oxford
+  - Cambridge
+  - UCL
+  - Imperial College
+  - Edinburgh
+  - ETH
+  - EPFL
+  - Tübingen
+  - Max Planck
+  - TU Munich
+  - University of Amsterdam
+  - INRIA
+  # Canadian
+  - Mila
+  - University of Toronto
+  - University of Montreal
+  - McGill
+  # Asian
+  - Tsinghua
+  - Peking University
+  - KAIST
+  - University of Tokyo
+  - NUS
+  - National University of Singapore
+  - HKUST
+  # Industry labs
+  - Google
+  - DeepMind
+  - Meta
+  - FAIR
+  - Microsoft Research
+  - Microsoft
+  - OpenAI
+  - Anthropic
+  - Apple
+  - NVIDIA
+  - Amazon
+  - IBM Research
+  - Allen Institute
+  - AI2
+  - Hugging Face
+  - HuggingFace
+  - Alibaba
+  - DAMO
+  - Baidu
+  - ByteDance
+  - Samsung
+  - Tesla
+
+benchmarks:
+  - RelBench
+  - OGB
+  - Open Graph Benchmark
+  - OpenML
+  - TabZilla
+  - WILDS

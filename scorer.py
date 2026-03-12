@@ -1,60 +1,152 @@
 """
-scorer.py — metadata & keyword-driven paper scoring engine.
+scorer.py — semantic similarity + metadata-driven paper scoring engine.
 
-Scores a paper out of 100 points using 9 heuristics:
+Scores a paper using 8 heuristics (point values configurable via config.yaml):
 
-  Relevance (65 pts):
-    1. Keyword Match              (max 30)  — config.yaml weighted keywords
-    2. Reference Overlap          (max 15)  — seed authors (h>50) + ref topics
-    3. Keyword Coverage           (max 10)  — fraction of config keywords hit
-    4. Author in Seed Refs        (max 10)  — candidate author cited by seeds
+  Relevance:
+    1. Semantic Similarity          — embedding cosine sim to seeds      (35)
+    2. Author in Seed Refs          — candidate authorId in seed refs    (10)
+    3. Cites Seed                   — paper directly cites seed papers   (15)
 
-  Quality (20 pts):
-    5. Author Authority           (max 10)  — logarithmic h-index
-    6. Citation Velocity          (max 10)  — effective citations / day
+  Quality:
+    4. Author Authority             — logarithmic h-index               (9)
+    5. Citation Velocity            — citations/day + recency prior      (12)
 
-  Bonuses (15 pts):
-    7. Institutional Authority    (flat  5) — affiliation check
-    8. Category Intersection      (flat  5) — arXiv cs.DB ∩ cs.LG/stat.ML
-    9. Benchmark Specificity      (max   5) — dataset/tool names in abstract
+  Bonuses:
+    6. Institutional Authority      — affiliation check                  (5)
+    7. Category Intersection        — dynamic seed-category overlap      (5)
+    8. Benchmark Specificity        — dataset names in abstract          (9)
 
 Call build_scoring_config(seed_papers, window_hours) once per session,
-then pass the returned config to score_paper() / rank_papers().
+then precompute_similarities(candidates, config) before scoring,
+then pass the config to score_paper() / rank_papers().
 """
 
+import re
 import math
 import copy
+import pickle
+import logging
 from pathlib import Path
 from typing import Any, Optional
 from datetime import datetime, timezone
 
 import yaml
 import numpy as np
-from sklearn.feature_extraction.text import CountVectorizer
+from sentence_transformers import SentenceTransformer
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Constants (static heuristics 4–7)
+# Defaults (overridden by config.yaml scoring/institutions/benchmarks)
 # ---------------------------------------------------------------------------
 
-MAX_KEYWORDS         = 30
-MAX_REFERENCES       = 15
-MAX_KW_COVERAGE      = 10
-MAX_SEED_REF_AUTHOR  = 10
-MAX_AUTHORITY        = 10
-MAX_CITATION_VEL     = 10
-FLAT_INSTITUTION     = 5
-FLAT_CROSS_CAT       = 5
-MAX_BENCHMARK        = 5
-MAX_TOTAL            = 100
+_DEFAULT_SCORING = {
+    "max_semantic": 35,
+    "max_seed_ref_author": 10,
+    "seed_ref_per_author": 4,
+    "max_cites_seed": 15,
+    "cites_seed_per_seed": 5,
+    "max_authority": 9,
+    "max_citation_vel": 12,
+    "flat_institution": 5,
+    "flat_cross_cat": 5,
+    "max_benchmark": 9,
+}
 
-TARGET_INSTITUTIONS: list[str] = [
-    "Stanford", "Max Planck", "DeepMind", "Meta", "FAIR",
-    "MIT", "Berkeley", "Tübingen",
+_DEFAULT_INSTITUTIONS: list[str] = [
+    "Stanford", "MIT", "Berkeley", "Carnegie Mellon", "CMU",
+    "Princeton", "Harvard", "Cornell", "Yale", "Columbia",
+    "University of Washington", "Georgia Tech", "UCLA", "NYU",
+    "University of Michigan", "UIUC", "University of Illinois",
+    "Caltech",
+    "Oxford", "Cambridge", "UCL", "Imperial College", "Edinburgh",
+    "ETH", "EPFL", "Tübingen", "Max Planck",
+    "TU Munich", "University of Amsterdam", "INRIA",
+    "Mila", "University of Toronto", "University of Montreal", "McGill",
+    "Tsinghua", "Peking University", "KAIST", "University of Tokyo",
+    "NUS", "National University of Singapore", "HKUST",
+    "Google", "DeepMind", "Meta", "FAIR",
+    "Microsoft Research", "Microsoft",
+    "OpenAI", "Anthropic", "Apple",
+    "NVIDIA", "Amazon", "IBM Research",
+    "Allen Institute", "AI2",
+    "Hugging Face", "HuggingFace",
+    "Alibaba", "DAMO", "Baidu", "ByteDance", "Samsung",
+    "Tesla",
 ]
 
-TARGET_BENCHMARKS: list[str] = [
-    "RelBench", "XGBoost", "CatBoost", "LightGBM", "AutoGluon",
+_DEFAULT_BENCHMARKS: list[str] = [
+    "RelBench", "OGB", "Open Graph Benchmark", "OpenML",
+    "TabZilla", "WILDS",
 ]
+
+_EMBED_MODEL = "all-MiniLM-L12-v2"
+_DEFAULT_CONFIG = Path(__file__).parent / "config.yaml"
+_CACHE_DIR = Path(__file__).parent / "cache"
+_CACHE_FILE = _CACHE_DIR / "embedding_cache.pkl"
+
+# Increment when embedding model or text format changes to invalidate stale cache
+_CACHE_VERSION = 3
+
+# Papers with fewer abstract words get a neutral similarity score
+_MIN_ABSTRACT_WORDS = 10
+
+
+# ---------------------------------------------------------------------------
+# Config file loading
+# ---------------------------------------------------------------------------
+
+def _load_config_file(path: Path | str | None = None) -> dict:
+    p = Path(path) if path else _DEFAULT_CONFIG
+    if not p.exists():
+        return {}
+    with open(p, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+# ---------------------------------------------------------------------------
+# Embedding cache
+# ---------------------------------------------------------------------------
+
+def _load_embedding_cache() -> dict[str, np.ndarray]:
+    if _CACHE_FILE.exists():
+        try:
+            with open(_CACHE_FILE, "rb") as f:
+                data = pickle.load(f)
+            if isinstance(data, dict) and data.get("_version") == _CACHE_VERSION:
+                return data.get("embeddings", {})
+            log.info("Embedding cache version mismatch, rebuilding")
+        except Exception:
+            log.warning("Failed to load embedding cache, starting fresh")
+    return {}
+
+
+def _save_embedding_cache(cache: dict[str, np.ndarray]) -> None:
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_CACHE_FILE, "wb") as f:
+        pickle.dump({"_version": _CACHE_VERSION, "embeddings": cache}, f)
+
+
+# ---------------------------------------------------------------------------
+# Institution regex builder (word-boundary matching)
+# ---------------------------------------------------------------------------
+
+def _build_institution_pattern(institutions: list[str]) -> re.Pattern:
+    escaped = [re.escape(inst) for inst in institutions]
+    pattern = r"\b(?:" + "|".join(escaped) + r")\b"
+    return re.compile(pattern, re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Embedding text builder
+# ---------------------------------------------------------------------------
+
+def _build_embed_text(paper: dict) -> str:
+    """Title repeated 3x for emphasis, followed by abstract."""
+    title = paper.get("title") or ""
+    abstract = paper.get("abstract") or ""
+    return f"{title}. {title}. {title}. {abstract}"
 
 
 # ---------------------------------------------------------------------------
@@ -67,278 +159,305 @@ def build_scoring_config(
     config_path: str | None = None,
 ) -> dict[str, Any]:
     """
-    Build dynamic scoring config from seed papers.
+    Build dynamic scoring config from seed papers + config.yaml.
 
-    Returns a config dict with keys:
-      keyword_weights   dict[str, int]       from config.yaml              (H1)
-      target_authors    list[str]            authors with h-index > 50    (H2)
-      target_topics     list[str]            frequent ref-title phrases    (H2)
-      seed_ref_authors  set[str]             author names from seed refs   (H4)
-      window_hours      int
+    Loads the embedding model, encodes seeds, auto-calibrates the
+    similarity threshold from inter-seed cosine similarity, and
+    extracts author IDs from seed references.
     """
+    file_cfg = _load_config_file(config_path)
+
+    # Scoring constants: config.yaml overrides defaults
+    sc = {**_DEFAULT_SCORING, **file_cfg.get("scoring", {})}
+
+    institutions = file_cfg.get("institutions", _DEFAULT_INSTITUTIONS)
+    benchmarks = file_cfg.get("benchmarks", _DEFAULT_BENCHMARKS)
+
+    # Load embedding model
+    model = SentenceTransformer(_EMBED_MODEL)
+
+    # Encode seed papers (title 3x)
+    seed_texts = [_build_embed_text(p) for p in seed_papers]
+    seed_embeddings = (
+        model.encode(seed_texts, normalize_embeddings=True, show_progress_bar=False)
+        if seed_texts
+        else np.empty((0, 0))
+    )
+
+    # Auto-calibrate similarity threshold from inter-seed similarity
+    if len(seed_embeddings) >= 2:
+        seed_sims = seed_embeddings @ seed_embeddings.T
+        mask = np.triu(np.ones(seed_sims.shape, dtype=bool), k=1)
+        sim_threshold = float(seed_sims[mask].mean())
+    else:
+        sim_threshold = 0.5
+
+    log.info(
+        "Similarity threshold auto-calibrated: %.3f (from %d seeds)",
+        sim_threshold, len(seed_embeddings),
+    )
+
+    # Compute max total dynamically from scoring constants
+    max_total = (
+        sc["max_semantic"] + sc["max_seed_ref_author"] + sc["max_cites_seed"]
+        + sc["max_authority"] + sc["max_citation_vel"]
+        + sc["flat_institution"] + sc["flat_cross_cat"] + sc["max_benchmark"]
+    )
+
+    # Extract distinct category groups from seeds for dynamic intersection
+    seed_cat_groups = _extract_seed_category_groups(seed_papers)
+    log.info(
+        "Category groups from seeds: %d distinct (%s)",
+        len(seed_cat_groups),
+        ", ".join(str(g) for g in seed_cat_groups),
+    )
+
     return {
-        "keyword_weights":  _load_keyword_weights(config_path),
-        "target_authors":   _extract_target_authors(seed_papers),
-        "target_topics":    _extract_reference_topics(seed_papers),
-        "seed_ref_authors": _extract_seed_ref_authors(seed_papers),
-        "window_hours":     window_hours,
+        # model + embeddings
+        "_model":            model,
+        "_seed_embeddings":  seed_embeddings,
+        "_sim_threshold":    sim_threshold,
+        "_institution_re":   _build_institution_pattern(institutions),
+        # author matching (by authorId)
+        "seed_ref_author_ids": _extract_seed_ref_author_ids(seed_papers),
+        # category intersection (dynamic)
+        "_seed_category_groups": seed_cat_groups,
+        # window
+        "window_hours":      window_hours,
+        # scoring constants (from config.yaml with defaults)
+        **sc,
+        "max_total":         max_total,
+        # lists
+        "benchmarks":        benchmarks,
     }
 
 
 # -- private helpers ---------------------------------------------------------
 
-_DEFAULT_CONFIG = Path(__file__).parent / "config.yaml"
-
-
-def _load_keyword_weights(config_path: Path | str | None = None) -> dict[str, int]:
-    """Load keyword_weights from config.yaml."""
-    path = Path(config_path) if config_path else _DEFAULT_CONFIG
-    if not path.exists():
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    return data.get("keyword_weights") or {}
-
-
-def _extract_target_authors(seed_papers: list[dict]) -> list[str]:
-    """Unique authors with h-index > 50 across all seed papers."""
-    seen: set[str] = set()
-    result: list[str] = []
-    for paper in seed_papers:
-        for author in (paper.get("authors") or []):
-            name = (author.get("name") or "").strip()
-            h = author.get("hIndex") or 0
-            if h > 50 and name and name not in seen:
-                result.append(name)
-                seen.add(name)
-    return result
-
-
-def _extract_reference_topics(
-    seed_papers: list[dict],
-    top_n: int = 10,
-) -> list[str]:
-    """
-    Most frequent n-gram phrases from reference titles of all seed papers.
-    These represent the canonical works in the research area.
-    """
-    ref_titles = [
-        ref.get("title") or ""
-        for paper in seed_papers
-        for ref in (paper.get("references") or [])
-        if ref.get("title")
-    ]
-    if not ref_titles:
-        return []
-
-    vec = CountVectorizer(
-        ngram_range=(1, 3),
-        stop_words="english",
-        max_features=200,
-        min_df=1,
-    )
-    try:
-        X = vec.fit_transform(ref_titles)
-    except ValueError:
-        return []
-
-    counts = np.asarray(X.sum(axis=0)).flatten()
-    names = vec.get_feature_names_out()
-    top_idx = counts.argsort()[-top_n:][::-1]
-    return [names[i] for i in top_idx if counts[i] > 0]
-
-
-def _extract_seed_ref_authors(seed_papers: list[dict]) -> set[str]:
-    """Collect unique lowercase author names from all seed papers' reference lists."""
-    names: set[str] = set()
+def _extract_seed_ref_author_ids(seed_papers: list[dict]) -> set[str]:
+    """Collect unique authorIds from all seed papers' reference lists."""
+    ids: set[str] = set()
     for paper in seed_papers:
         for ref in (paper.get("references") or []):
             for author in (ref.get("authors") or []):
-                name = (author.get("name") or "").strip().lower()
-                if name:
-                    names.add(name)
-    return names
+                aid = (author.get("authorId") or "").strip()
+                if aid:
+                    ids.add(aid)
+    return ids
 
+
+def _extract_seed_category_groups(seed_papers: list[dict]) -> list[set[str]]:
+    """
+    Extract distinct category sets from seed papers.
+
+    Each seed contributes its set of arXiv-like categories.
+    Duplicate category sets are collapsed so that e.g. four seeds all tagged
+    {cs.LG, cs.AI} count as one group, not four.
+
+    Used by score_category_intersection to reward candidates that bridge
+    2+ distinct seed category groups.
+    """
+    groups: list[set[str]] = []
+    seen: set[frozenset[str]] = set()
+    for p in seed_papers:
+        cats = frozenset(p.get("categories") or [])
+        if cats and cats not in seen:
+            seen.add(cats)
+            groups.append(set(cats))
+    return groups
 
 
 # ---------------------------------------------------------------------------
-# Heuristic 1: Dynamic Weighted Keywords
+# Pre-computation — call once before scoring
 # ---------------------------------------------------------------------------
 
-def score_weighted_keywords(
-    title: str,
-    abstract: str,
+def precompute_similarities(
+    candidates: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> None:
+    """
+    Batch-encode candidate papers and compute max cosine similarity
+    to any seed paper.  Uses embedding cache for previously seen papers.
+    Papers with no/very short abstract get a neutral similarity value.
+    Stores '_semantic_sim' in each paper dict.
+    """
+    model = config.get("_model")
+    seed_emb = config.get("_seed_embeddings")
+    threshold = config.get("_sim_threshold", 0.5)
+
+    if model is None or seed_emb is None or seed_emb.size == 0 or not candidates:
+        return
+
+    dim = seed_emb.shape[1]
+    cache = _load_embedding_cache()
+
+    # Split into cached vs needs-encoding
+    need_encoding: list[int] = []
+    cached_embs: dict[int, np.ndarray] = {}
+
+    for i, p in enumerate(candidates):
+        pid = p.get("ss_id") or p.get("arxiv_id") or ""
+        if pid and pid in cache:
+            cached_embs[i] = cache[pid]
+        else:
+            need_encoding.append(i)
+
+    log.info("Embeddings: %d cached, %d to encode", len(cached_embs), len(need_encoding))
+
+    # Encode uncached papers
+    new_embs: dict[int, np.ndarray] = {}
+    if need_encoding:
+        texts = [_build_embed_text(candidates[i]) for i in need_encoding]
+        encoded = model.encode(
+            texts, normalize_embeddings=True, show_progress_bar=False,
+        )
+        for idx, emb in zip(need_encoding, encoded):
+            new_embs[idx] = emb
+            pid = candidates[idx].get("ss_id") or candidates[idx].get("arxiv_id") or ""
+            if pid:
+                cache[pid] = emb
+
+    # Save updated cache
+    if need_encoding:
+        _save_embedding_cache(cache)
+
+    # Build full embedding matrix and compute similarities
+    cand_emb = np.zeros((len(candidates), dim), dtype=np.float32)
+    for i in range(len(candidates)):
+        if i in cached_embs:
+            cand_emb[i] = cached_embs[i]
+        elif i in new_embs:
+            cand_emb[i] = new_embs[i]
+
+    sims = cand_emb @ seed_emb.T
+    max_sims = sims.max(axis=1)
+
+    for paper, sim in zip(candidates, max_sims):
+        abstract = paper.get("abstract") or ""
+        if len(abstract.split()) < _MIN_ABSTRACT_WORDS:
+            # Unreliable embedding — assign neutral score (half threshold)
+            paper["_semantic_sim"] = threshold * 0.5
+        else:
+            paper["_semantic_sim"] = float(sim)
+
+
+# ---------------------------------------------------------------------------
+# Heuristic 1: Semantic Similarity
+# ---------------------------------------------------------------------------
+
+def score_semantic_similarity(paper: dict[str, Any], config: dict[str, Any]) -> int:
+    """
+    Score from pre-computed cosine similarity to seed papers.
+    Uses a softer clip: papers must reach 1.3x the inter-seed mean
+    similarity to earn full score, giving headroom to differentiate
+    above-threshold papers.
+    """
+    sim = paper.get("_semantic_sim", 0.0)
+    if sim <= 0:
+        return 0
+    threshold = config.get("_sim_threshold", 0.5)
+    max_pts = config.get("max_semantic", _DEFAULT_SCORING["max_semantic"])
+    normalized = min(sim / (threshold * 1.3), 1.0)
+    return round(normalized * max_pts)
+
+
+# ---------------------------------------------------------------------------
+# Heuristic 2: Author in Seed References (by authorId)
+# ---------------------------------------------------------------------------
+
+def score_author_in_seed_refs(
+    authors: list[dict[str, Any]],
     config: dict[str, Any],
 ) -> int:
     """
-    Scan title (2× weight) and abstract (1× weight) for config keywords.
-    Each keyword counted at most once per field.
-    Capped at MAX_KEYWORDS (30).
+    Award points per candidate author whose SS authorId appears
+    in the seed papers' reference author lists.
     """
-    keyword_weights = config.get("keyword_weights") or {}
-    if not keyword_weights:
+    seed_ref_ids = config.get("seed_ref_author_ids") or set()
+    if not seed_ref_ids:
         return 0
-    title_lower    = title.lower()
-    abstract_lower = abstract.lower()
+    per_author = config.get("seed_ref_per_author", _DEFAULT_SCORING["seed_ref_per_author"])
+    max_pts = config.get("max_seed_ref_author", _DEFAULT_SCORING["max_seed_ref_author"])
     total = 0
-    for keyword, weight in keyword_weights.items():
-        kw = keyword.lower()
-        if kw in title_lower:
-            total += weight * 2
-        if kw in abstract_lower:
-            total += weight * 1
-    return min(total, MAX_KEYWORDS)
+    for author in authors:
+        aid = (author.get("authorId") or "").strip()
+        if aid and aid in seed_ref_ids:
+            total += per_author
+    return min(total, max_pts)
 
 
 # ---------------------------------------------------------------------------
-# Heuristic 2: Author Authority (logarithmic h-index)
+# Heuristic 3: Cites Seed Papers
 # ---------------------------------------------------------------------------
 
-def score_author_authority(authors: list[dict[str, Any]]) -> int:
+def score_cites_seed(paper: dict[str, Any], config: dict[str, Any]) -> int:
     """
-    score = round(10 × log(max_h + 1) / log(101)), capped at 10.
-    Calibration: h=10→5, h=25→7, h=50→9, h=100→10.
+    Award points if this paper directly cites one or more seed papers.
+    Detected during the citation crawl discovery channel.
+    """
+    count = paper.get("_cites_seed_count", 0)
+    if count <= 0:
+        return 0
+    per_seed = config.get("cites_seed_per_seed", _DEFAULT_SCORING["cites_seed_per_seed"])
+    max_pts = config.get("max_cites_seed", _DEFAULT_SCORING["max_cites_seed"])
+    return min(count * per_seed, max_pts)
+
+
+# ---------------------------------------------------------------------------
+# Heuristic 4: Author Authority (logarithmic h-index)
+# ---------------------------------------------------------------------------
+
+def score_author_authority(
+    authors: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> int:
+    """
+    score = round(max_pts * log(max_h + 1) / log(101)), capped.
+    Calibration at max_pts=10: h=10->5, h=25->7, h=50->9, h=100->10.
     """
     if not authors:
         return 0
     max_h = max((a.get("hIndex") or 0) for a in authors)
     if max_h <= 0:
         return 0
-    return min(round(10 * math.log(max_h + 1) / math.log(101)), MAX_AUTHORITY)
+    max_pts = config.get("max_authority", _DEFAULT_SCORING["max_authority"])
+    return min(round(max_pts * math.log(max_h + 1) / math.log(101)), max_pts)
 
 
 # ---------------------------------------------------------------------------
-# Heuristic 3: Dynamic Reference Overlap
+# Heuristic 5: Citation Velocity (with window-scaled recency prior)
 # ---------------------------------------------------------------------------
 
-def score_reference_overlap(
-    references: list[dict[str, Any]],
-    config: dict[str, Any],
-) -> int:
-    """
-    5 pts per unique match of:
-      - target_authors (seed authors with h-index > 50, exact full-name match)
-      - target_topics  (frequent phrases from seed reference titles, substring)
-    Capped at MAX_REFERENCES (15).
-    """
-    target_authors = config.get("target_authors") or []
-    target_topics  = config.get("target_topics") or []
-    matched: set[str] = set()
-
-    for ref in references:
-        ref_title   = (ref.get("title") or "").lower()
-        ref_authors = ref.get("authors") or []
-
-        for topic in target_topics:
-            if topic not in matched and topic.lower() in ref_title:
-                matched.add(topic)
-
-        for target in target_authors:
-            if target not in matched:
-                for author in ref_authors:
-                    if target.lower() == (author.get("name") or "").lower():
-                        matched.add(target)
-                        break
-
-    return min(len(matched) * 5, MAX_REFERENCES)
-
-
-
-# ---------------------------------------------------------------------------
-# Heuristic 5: Institutional Authority
-# ---------------------------------------------------------------------------
-
-def score_institutional_authority(authors: list[dict[str, Any]]) -> int:
-    """Flat 5 if any author is affiliated with a target institution."""
-    for author in authors:
-        affiliations = author.get("affiliations") or []
-        if isinstance(affiliations, str):
-            affiliations = [affiliations]
-        affil_str = " ".join(affiliations).lower()
-        for inst in TARGET_INSTITUTIONS:
-            if inst.lower() in affil_str:
-                return FLAT_INSTITUTION
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# Heuristic 6: Category Intersection
-# ---------------------------------------------------------------------------
-
-def score_category_intersection(categories: list[str]) -> int:
-    """Flat 5 if paper has cs.DB AND (cs.LG OR stat.ML). Case-sensitive."""
-    if "cs.DB" in categories and (
-        "cs.LG" in categories or "stat.ML" in categories
-    ):
-        return FLAT_CROSS_CAT
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# Heuristic 7: Benchmark / Baseline Specificity
-# ---------------------------------------------------------------------------
-
-def score_benchmark_specificity(abstract: str) -> int:
-    """5 pts for any benchmark match in abstract, capped at 5."""
-    abstract_lower = abstract.lower()
-    matched = sum(1 for b in TARGET_BENCHMARKS if b.lower() in abstract_lower)
-    return min(matched * 5, MAX_BENCHMARK)
-
-
-# ---------------------------------------------------------------------------
-# Heuristic 3b: Keyword Coverage (fraction of config keywords present)
-# ---------------------------------------------------------------------------
-
-def score_keyword_coverage(
-    title: str,
-    abstract: str,
-    config: dict[str, Any],
-) -> int:
-    """
-    Fraction of distinct config keywords that appear in title or abstract.
-    Score = round(keywords_hit / total_keywords × MAX_KW_COVERAGE), capped at 10.
-    """
-    keyword_weights = config.get("keyword_weights") or {}
-    if not keyword_weights:
-        return 0
-    candidate = (title + " " + abstract).lower()
-    hits = sum(1 for kw in keyword_weights if kw.lower() in candidate)
-    return min(round(hits / len(keyword_weights) * MAX_KW_COVERAGE), MAX_KW_COVERAGE)
-
-
-# ---------------------------------------------------------------------------
-# Heuristic 9: Citation Velocity (citations / day)
-# ---------------------------------------------------------------------------
-
-def score_recency_momentum(
+def score_citation_velocity(
     paper: dict[str, Any],
     config: dict[str, Any],
     _now: Optional[datetime] = None,
 ) -> int:
     """
-    Citation velocity = effective_citations / days_since_publication.
-    Influential citations count 3× (they are already included once in
-    citationCount, so we add 2× influentialCitationCount on top).
-    Capped at MAX_CITATION_VEL (10).
+    Combines citation velocity with a recency prior scaled to the
+    lookback window.
 
-    Bins (effective citations/day):
-      ≥ 5.0 → 10
-      ≥ 2.0 → 8
-      ≥ 1.0 → 6
-      ≥ 0.5 → 4
-      ≥ 0.2 → 3
-      ≥ 0.1 → 2
-      < 0.1 → 0
+    Recency prior (benefit of the doubt for new papers):
+      < 15% of window  ->  base 5 pts
+      < 35% of window  ->  base 3 pts
+      >= 35%            ->  base 0 pts (must earn via citations)
 
-    Papers with no publication date or published today get 0.
-    _now: injectable datetime for testing (defaults to datetime.now(utc)).
+    Citation velocity bins (effective citations/day):
+      >= 5.0 -> 10    >= 0.5 -> 4
+      >= 2.0 -> 8     >= 0.2 -> 3
+      >= 1.0 -> 6     >= 0.1 -> 2
+
+    Final score = max(base, velocity_score), capped.
+    Influential citations count 3x (2x bonus on top of base count).
     """
-    published    = paper.get("published") or ""
-    citations    = paper.get("citationCount") or 0
-    influential  = paper.get("influentialCitationCount") or 0
-    effective    = citations + influential * 2
+    published   = paper.get("published") or ""
+    citations   = paper.get("citationCount") or 0
+    influential = paper.get("influentialCitationCount") or 0
+    effective   = citations + influential * 2
+    max_pts     = config.get("max_citation_vel", _DEFAULT_SCORING["max_citation_vel"])
+    window_hours = config.get("window_hours", 168)
 
-    if not published or effective <= 0:
+    if not published:
         return 0
 
     try:
@@ -350,48 +469,106 @@ def score_recency_momentum(
     except ValueError:
         return 0
 
-    if age_days < 1:
+    if age_days < 0:
         return 0
 
-    velocity = effective / age_days
+    # Scale recency thresholds to window size
+    window_days = window_hours / 24
+    fresh_cutoff = window_days * 0.15
+    mid_cutoff = window_days * 0.35
 
-    if velocity >= 5.0:
-        return 10
-    elif velocity >= 2.0:
-        return 8
-    elif velocity >= 1.0:
-        return 6
-    elif velocity >= 0.5:
-        return 4
-    elif velocity >= 0.2:
-        return 3
-    elif velocity >= 0.1:
-        return 2
+    if age_days < fresh_cutoff:
+        base = 5
+    elif age_days < mid_cutoff:
+        base = 3
     else:
-        return 0
+        base = 0
+
+    # Citation velocity
+    vel_score = 0
+    if age_days >= 1 and effective > 0:
+        velocity = effective / age_days
+        if velocity >= 5.0:
+            vel_score = 10
+        elif velocity >= 2.0:
+            vel_score = 8
+        elif velocity >= 1.0:
+            vel_score = 6
+        elif velocity >= 0.5:
+            vel_score = 4
+        elif velocity >= 0.2:
+            vel_score = 3
+        elif velocity >= 0.1:
+            vel_score = 2
+
+    return min(max(base, vel_score), max_pts)
 
 
 # ---------------------------------------------------------------------------
-# Heuristic 4: Author in Seed References
+# Heuristic 6: Institutional Authority (word-boundary matching)
 # ---------------------------------------------------------------------------
 
-def score_author_in_seed_refs(
+def score_institutional_authority(
     authors: list[dict[str, Any]],
     config: dict[str, Any],
 ) -> int:
-    """
-    Award points if any of the candidate's authors appear as authors
-    in the seed papers' reference lists (i.e., this person's work is
-    cited by the seeds — they are part of the research community).
-    Flat MAX_SEED_REF_AUTHOR (10) for any match.
-    """
-    seed_ref_authors = config.get("seed_ref_authors") or set()
-    if not seed_ref_authors:
+    """Flat points if any author affiliated with a target institution."""
+    pattern = config.get("_institution_re")
+    if pattern is None:
         return 0
+    flat_pts = config.get("flat_institution", _DEFAULT_SCORING["flat_institution"])
     for author in authors:
-        name = (author.get("name") or "").strip().lower()
-        if name and name in seed_ref_authors:
-            return MAX_SEED_REF_AUTHOR
+        affiliations = author.get("affiliations") or []
+        if isinstance(affiliations, str):
+            affiliations = [affiliations]
+        affil_str = " ".join(affiliations)
+        if pattern.search(affil_str):
+            return flat_pts
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Heuristic 7: Category Intersection (dynamic seed-category overlap)
+# ---------------------------------------------------------------------------
+
+def score_category_intersection(
+    categories: list[str],
+    config: dict[str, Any],
+) -> int:
+    """
+    Award points if the paper's categories overlap with 2+ distinct
+    seed-paper category groups (i.e. it bridges multiple research areas
+    represented by the seeds).
+
+    Category groups are extracted from seed papers at config time and
+    deduplicated, so identical seeds don't inflate the count.
+    """
+    seed_groups = config.get("_seed_category_groups", [])
+    if len(seed_groups) < 2 or not categories:
+        return 0
+    max_pts = config.get("flat_cross_cat", _DEFAULT_SCORING["flat_cross_cat"])
+    cat_set = set(categories)
+    groups_hit = sum(1 for group in seed_groups if cat_set & group)
+    if groups_hit < 2:
+        return 0
+    return max_pts
+
+
+# ---------------------------------------------------------------------------
+# Heuristic 8: Benchmark Specificity (dataset names in abstract)
+# ---------------------------------------------------------------------------
+
+def score_benchmark_specificity(
+    abstract: str,
+    config: dict[str, Any],
+) -> int:
+    """Full points for any benchmark/dataset name in abstract."""
+    benchmarks = config.get("benchmarks", _DEFAULT_BENCHMARKS)
+    max_pts = config.get("max_benchmark", _DEFAULT_SCORING["max_benchmark"])
+    abstract_lower = abstract.lower()
+    for b in benchmarks:
+        if b.lower() in abstract_lower:
+            return max_pts
     return 0
 
 
@@ -401,47 +578,44 @@ def score_author_in_seed_refs(
 
 def score_paper(paper: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     """
-    Score a single paper using all 9 heuristics.
+    Score a single paper using all 8 heuristics.
     Returns a shallow copy of the paper with 'score_breakdown' injected.
     """
-    title      = paper.get("title") or ""
-    abstract   = paper.get("abstract") or ""
     authors    = paper.get("authors") or []
-    references = paper.get("references") or []
+    abstract   = paper.get("abstract") or ""
     categories = paper.get("categories") or []
+    max_total  = config.get("max_total", 100)
 
-    kw    = score_weighted_keywords(title, abstract, config)
-    refs  = score_reference_overlap(references, config)
-    cov   = score_keyword_coverage(title, abstract, config)
+    sem   = score_semantic_similarity(paper, config)
     sref  = score_author_in_seed_refs(authors, config)
-    auth  = score_author_authority(authors)
-    vel   = score_recency_momentum(paper, config)
-    inst  = score_institutional_authority(authors)
-    cat   = score_category_intersection(categories)
-    bench = score_benchmark_specificity(abstract)
+    cseed = score_cites_seed(paper, config)
+    auth  = score_author_authority(authors, config)
+    vel   = score_citation_velocity(paper, config)
+    inst  = score_institutional_authority(authors, config)
+    cat   = score_category_intersection(categories, config)
+    bench = score_benchmark_specificity(abstract, config)
 
-    total = min(kw + refs + cov + sref + auth + vel + inst + cat + bench, MAX_TOTAL)
+    total = min(sem + sref + cseed + auth + vel + inst + cat + bench, max_total)
 
     summary = (
-        f"Total: {total}/{MAX_TOTAL} | "
-        f"KW: {kw}, Ref: {refs}, Cov: {cov}, SRef: {sref}, "
-        f"Auth: {auth}, Vel: {vel}, "
-        f"Inst: {inst}, Cat: {cat}, Bench: {bench}"
+        f"Total: {total}/{max_total} | "
+        f"Sem: {sem}, SRef: {sref}, Cite: {cseed}, Auth: {auth}, "
+        f"Vel: {vel}, Inst: {inst}, Cat: {cat}, Bench: {bench}"
     )
 
     result = copy.copy(paper)
     result["score_breakdown"] = {
-        "total":       total,
-        "keywords":    kw,
-        "references":  refs,
-        "kw_coverage": cov,
-        "seed_ref":    sref,
-        "authority":   auth,
-        "velocity":    vel,
-        "institution": inst,
-        "cross_cat":   cat,
-        "benchmark":   bench,
-        "summary":     summary,
+        "total":         total,
+        "max_total":     max_total,
+        "semantic":      sem,
+        "seed_ref":      sref,
+        "cites_seed":    cseed,
+        "authority":     auth,
+        "velocity":      vel,
+        "institution":   inst,
+        "cross_cat":     cat,
+        "benchmark":     bench,
+        "summary":       summary,
     }
     return result
 

@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+cache/
+*.egg-info/
+.DS_Store
+out.txt
+out copy.txt
+results.txt

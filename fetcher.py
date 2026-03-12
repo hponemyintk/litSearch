@@ -14,7 +14,6 @@ import os
 import re
 import time
 import logging
-from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -31,7 +30,9 @@ log = logging.getLogger(__name__)
 _SS_BASE         = "https://api.semanticscholar.org/graph/v1"
 _SS_BATCH_LIMIT  = 500    # max IDs per POST /paper/batch
 _SS_AUTHOR_BATCH = 1000   # max IDs per POST /author/batch
-_SS_LEEWAY       = 1.5    # seconds between API calls (extra safety margin)
+_SS_LEEWAY_KEY   = 1.5    # seconds between calls (with API key)
+_SS_LEEWAY_FREE  = 3.5    # seconds between calls (no API key — stricter limits)
+_SS_MAX_429      = 8       # max consecutive 429s before giving up
 
 _SS_API_KEY: str | None = os.environ.get("SS_API_KEY") or None
 
@@ -50,49 +51,75 @@ def _ss_headers() -> dict:
     return h
 
 
+def _leeway() -> float:
+    return _SS_LEEWAY_KEY if _SS_API_KEY else _SS_LEEWAY_FREE
+
+
 # ---------------------------------------------------------------------------
 # HTTP helpers with retry + 429 handling + leeway
+#
+# 429 rate limits do NOT consume error retries — they are expected behaviour
+# and the code will keep retrying with increasing backoff up to _SS_MAX_429
+# consecutive 429s before giving up.
 # ---------------------------------------------------------------------------
 
-def _ss_get(url: str, params: dict | None = None, retries: int = 3):
+def _ss_get(url: str, params: dict | None = None, retries: int = 4):
     """GET with retry, 429 back-off, and leeway sleep."""
-    for attempt in range(retries):
+    gap = _leeway()
+    attempt = 0
+    rate_hits = 0
+    while attempt < retries:
         try:
             resp = requests.get(url, params=params,
-                                headers=_ss_headers(), timeout=60)
+                                headers=_ss_headers(), timeout=90)
             if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After", 10)) + _SS_LEEWAY
-                log.warning("SS rate limited (GET); sleeping %ds", wait)
+                rate_hits += 1
+                if rate_hits > _SS_MAX_429:
+                    log.error("SS rate limit: %d consecutive 429s, giving up", _SS_MAX_429)
+                    return None
+                wait = int(resp.headers.get("Retry-After", 5)) + gap * rate_hits
+                log.warning("SS rate limited (GET); waiting %ds (%d/%d)",
+                            int(wait), rate_hits, _SS_MAX_429)
                 time.sleep(wait)
-                continue
+                continue   # retry WITHOUT incrementing attempt
             resp.raise_for_status()
-            time.sleep(_SS_LEEWAY)
+            time.sleep(gap)
             return resp.json()
         except requests.RequestException as exc:
+            attempt += 1
             log.warning("SS GET error (attempt %d/%d): %s",
-                        attempt + 1, retries, exc)
-            time.sleep(2 ** attempt + _SS_LEEWAY)
+                        attempt, retries, exc)
+            time.sleep(2 ** attempt + gap)
     return None
 
 
-def _ss_post(url: str, json: dict, params: dict | None = None, retries: int = 3):
+def _ss_post(url: str, json: dict, params: dict | None = None, retries: int = 4):
     """POST with retry, 429 back-off, and leeway sleep."""
-    for attempt in range(retries):
+    gap = _leeway()
+    attempt = 0
+    rate_hits = 0
+    while attempt < retries:
         try:
             resp = requests.post(url, json=json, params=params,
-                                 headers=_ss_headers(), timeout=60)
+                                 headers=_ss_headers(), timeout=90)
             if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After", 10)) + _SS_LEEWAY
-                log.warning("SS rate limited (POST); sleeping %ds", wait)
+                rate_hits += 1
+                if rate_hits > _SS_MAX_429:
+                    log.error("SS rate limit: %d consecutive 429s, giving up", _SS_MAX_429)
+                    return None
+                wait = int(resp.headers.get("Retry-After", 5)) + gap * rate_hits
+                log.warning("SS rate limited (POST); waiting %ds (%d/%d)",
+                            int(wait), rate_hits, _SS_MAX_429)
                 time.sleep(wait)
-                continue
+                continue   # retry WITHOUT incrementing attempt
             resp.raise_for_status()
-            time.sleep(_SS_LEEWAY)
+            time.sleep(gap)
             return resp.json()
         except requests.RequestException as exc:
+            attempt += 1
             log.warning("SS POST error (attempt %d/%d): %s",
-                        attempt + 1, retries, exc)
-            time.sleep(2 ** attempt + _SS_LEEWAY)
+                        attempt, retries, exc)
+            time.sleep(2 ** attempt + gap)
     return None
 
 
@@ -165,7 +192,10 @@ def _ss_entry_to_paper(entry: dict, arxiv_id: str = "") -> dict:
         "references": [
             {
                 "title":   r.get("title") or "",
-                "authors": [{"name": a.get("name", "")} for a in (r.get("authors") or [])],
+                "authors": [
+                    {"name": a.get("name", ""), "authorId": a.get("authorId") or ""}
+                    for a in (r.get("authors") or [])
+                ],
             }
             for r in (entry.get("references") or [])
         ],
@@ -175,7 +205,7 @@ def _ss_entry_to_paper(entry: dict, arxiv_id: str = "") -> dict:
 
 
 # ---------------------------------------------------------------------------
-# URL → arXiv ID extraction & seed loading
+# URL → SS paper ID resolution & seed loading
 # ---------------------------------------------------------------------------
 
 _ARXIV_RE = re.compile(
@@ -183,6 +213,8 @@ _ARXIV_RE = re.compile(
     r"|(?:^|[/:\s])arxiv[:\s](\d{4}\.\d{4,5}(?:v\d+)?)",
     re.IGNORECASE,
 )
+
+_DOI_RE = re.compile(r"(10\.\d{4,}/[^\s?#]+)")
 
 
 def parse_arxiv_id(url_or_id: str) -> Optional[str]:
@@ -194,11 +226,98 @@ def parse_arxiv_id(url_or_id: str) -> Optional[str]:
     return None
 
 
+def _try_arxiv(url: str) -> Optional[str]:
+    """Try to extract ARXIV:id from an arXiv URL or arxiv: prefix."""
+    m = _ARXIV_RE.search(url)
+    if m:
+        raw = m.group(1) or m.group(2)
+        return f"ARXIV:{raw.split('v')[0]}"
+    return None
+
+
+def _try_doi_in_url(url: str) -> Optional[str]:
+    """Try to extract DOI from a URL that contains a 10.xxxx/ pattern."""
+    m = _DOI_RE.search(url)
+    if m:
+        doi = m.group(1).rstrip("/")
+        return f"DOI:{doi}"
+    return None
+
+
+def _try_publisher_url(url: str) -> Optional[str]:
+    """
+    Construct a DOI from known publisher URL patterns where the DOI
+    is NOT explicitly present in the URL.
+    """
+    # Nature: nature.com/articles/{articleId} → DOI:10.1038/{articleId}
+    m = re.search(r"nature\.com/articles/([\w.-]+)", url, re.I)
+    if m:
+        return f"DOI:10.1038/{m.group(1)}"
+
+    # Science.org: science.org/doi/{doi}
+    m = re.search(r"science\.org/doi/(10\.\d{4,}/[^\s?#]+)", url, re.I)
+    if m:
+        return f"DOI:{m.group(1)}"
+
+    # PNAS: pnas.org/doi/{abs|full}/{doi}
+    m = re.search(r"pnas\.org/doi/(?:abs|full)/(10\.\d{4,}/[^\s?#]+)", url, re.I)
+    if m:
+        return f"DOI:{m.group(1)}"
+
+    # Cell Press: cell.com/{journal}/fulltext/{PII} — resolve via DOI prefix
+    m = re.search(r"cell\.com/[^/]+/fulltext/(S[\d-]+)", url, re.I)
+    if m:
+        return f"DOI:10.1016/{m.group(1)}"
+
+    return None
+
+
+def _try_pubmed(url: str) -> Optional[str]:
+    """Try to extract PMID or PMCID from PubMed/PMC URLs."""
+    m = re.search(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)", url, re.I)
+    if m:
+        return f"PMID:{m.group(1)}"
+    m = re.search(r"ncbi\.nlm\.nih\.gov/pmc/articles/(PMC\d+)", url, re.I)
+    if m:
+        return f"PMCID:{m.group(1)}"
+    return None
+
+
+def resolve_url_to_ss_paper_id(url: str) -> Optional[str]:
+    """
+    Resolve a URL to a Semantic Scholar paper ID.
+
+    Strategies (in priority order):
+      1. arXiv URL/prefix   → ARXIV:id
+      2. DOI in URL          → DOI:10.xxxx/...
+      3. Publisher pattern   → DOI:10.xxxx/...  (Nature, Science, PNAS, Cell)
+      4. PubMed/PMC URL      → PMID:xxx / PMCID:PMCxxx
+    """
+    url = url.strip()
+    for strategy in (_try_arxiv, _try_doi_in_url, _try_publisher_url, _try_pubmed):
+        result = strategy(url)
+        if result:
+            return result
+    return None
+
+
+def _is_recent(date_str: str, cutoff: datetime) -> bool:
+    """Return True if date_str (YYYY-MM-DD) is at or after the cutoff datetime."""
+    if not date_str:
+        return False
+    try:
+        dt = datetime.strptime(date_str[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return dt >= cutoff
+    except ValueError:
+        return False
+
+
 def load_seed_urls(filepath: str) -> list[str]:
     """
-    Read paper URLs (one per line), extract arXiv IDs.
-    Non-arXiv URLs are skipped with a warning.
-    Returns deduplicated list of bare arXiv IDs.
+    Read paper URLs/IDs (one per line), resolve to SS paper IDs.
+    Supports arXiv, DOI, Nature, PubMed, PMC, Science.org, PNAS, Cell, and
+    any URL containing a DOI (e.g. Springer, Wiley, IEEE, ACM).
+    Returns deduplicated list of SS paper IDs.
     """
     ids: list[str] = []
     seen: set[str] = set()
@@ -207,13 +326,13 @@ def load_seed_urls(filepath: str) -> list[str]:
             url = line.strip()
             if not url or url.startswith("#"):
                 continue
-            arxiv_id = parse_arxiv_id(url)
-            if arxiv_id and arxiv_id not in seen:
-                ids.append(arxiv_id)
-                seen.add(arxiv_id)
-                log.info("Resolved  %-55s  →  %s", url[:55], arxiv_id)
-            elif not arxiv_id:
-                log.warning("Skipping non-arXiv URL: %s", url)
+            paper_id = resolve_url_to_ss_paper_id(url)
+            if paper_id and paper_id not in seen:
+                ids.append(paper_id)
+                seen.add(paper_id)
+                log.info("Resolved  %-55s  →  %s", url[:55], paper_id)
+            elif not paper_id:
+                log.warning("Could not resolve URL: %s", url)
     return ids
 
 
@@ -232,26 +351,29 @@ _SEED_FIELDS = (
 )
 
 
-def fetch_seed_papers(arxiv_ids: list[str]) -> list[dict]:
-    """Fetch full seed paper metadata via SS /paper/batch (one call)."""
-    if not arxiv_ids:
+def fetch_seed_papers(paper_ids: list[str]) -> list[dict]:
+    """
+    Fetch full seed paper metadata via SS /paper/batch.
+    Accepts any SS-compatible paper IDs (ARXIV:, DOI:, PMID:, PMCID:, etc.).
+    """
+    if not paper_ids:
         return []
 
     papers: list[dict] = []
-    for i in range(0, len(arxiv_ids), _SS_BATCH_LIMIT):
-        chunk = arxiv_ids[i: i + _SS_BATCH_LIMIT]
+    for i in range(0, len(paper_ids), _SS_BATCH_LIMIT):
+        chunk = paper_ids[i: i + _SS_BATCH_LIMIT]
         data = _ss_post(
             f"{_SS_BASE}/paper/batch",
-            json={"ids": [f"ARXIV:{aid}" for aid in chunk]},
+            json={"ids": chunk},
             params={"fields": _SEED_FIELDS},
         )
         if not data:
             continue
-        for entry, aid in zip(data, chunk):
+        for entry in data:
             if entry:
-                papers.append(_ss_entry_to_paper(entry, aid))
+                papers.append(_ss_entry_to_paper(entry))
 
-    log.info("Fetched %d/%d seed papers from SS", len(papers), len(arxiv_ids))
+    log.info("Fetched %d/%d seed papers from SS", len(papers), len(paper_ids))
     return papers
 
 
@@ -265,12 +387,12 @@ _DEFAULT_CONFIG = Path(__file__).parent / "config.yaml"
 
 
 def _build_search_query() -> str:
-    """Build search query from keyword_weights in config.yaml."""
+    """Build search query from keywords list in config.yaml."""
     keywords: list[str] = []
     if _DEFAULT_CONFIG.exists():
         with open(_DEFAULT_CONFIG, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        keywords = list((data.get("keyword_weights") or {}).keys())
+        keywords = data.get("keywords") or []
     query = " | ".join(keywords) if keywords else "machine learning"
     log.info("Search query: %s", query)
     return query
@@ -325,15 +447,21 @@ def _search_recent(hours: int) -> list[dict]:
 _CITATIONS_MAX_OFFSET = 9999   # SS citations endpoint hard limit
 
 
-def _fetch_recent_citers(seed_papers: list[dict], hours: int) -> list[dict]:
+def _fetch_recent_citers(
+    seed_papers: list[dict], hours: int,
+) -> tuple[list[dict], dict[str, int]]:
     """
     For each seed paper, fetch its citing papers via GET /paper/{id}/citations.
     Keep only citers published within the lookback window.
-    Paginates (500/page), stops at SS offset limit (9999).
+
+    Returns:
+      citers      — deduplicated list of citing paper dicts
+      cites_count — mapping paperId → number of distinct seeds cited
     """
     cutoff = (datetime.now(tz=timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d")
     seen_ids: set[str] = set()
     citers: list[dict] = []
+    cites_count: dict[str, int] = {}
 
     for seed in seed_papers:
         ss_id = seed.get("ss_id")
@@ -344,9 +472,11 @@ def _fetch_recent_citers(seed_papers: list[dict], hours: int) -> list[dict]:
         offset = 0
 
         while offset < _CITATIONS_MAX_OFFSET:
+            remaining = _CITATIONS_MAX_OFFSET - offset
+            page_limit = min(500, remaining)
             data = _ss_get(
                 f"{_SS_BASE}/paper/{ss_id}/citations",
-                params={"fields": _SEARCH_FIELDS, "offset": offset, "limit": 500},
+                params={"fields": _SEARCH_FIELDS, "offset": offset, "limit": page_limit},
             )
             if not data:
                 break
@@ -360,13 +490,17 @@ def _fetch_recent_citers(seed_papers: list[dict], hours: int) -> list[dict]:
                 pid = citing.get("paperId") or ""
                 pub_date = citing.get("publicationDate") or ""
 
-                if not pid or pid in seen_ids:
+                if not pid:
                     continue
 
                 if pub_date >= cutoff and _is_cs_paper(citing):
-                    seen_ids.add(pid)
-                    citers.append(_ss_entry_to_paper(citing))
-                    seed_citers += 1
+                    # Track how many seeds this paper cites (before dedup)
+                    cites_count[pid] = cites_count.get(pid, 0) + 1
+
+                    if pid not in seen_ids:
+                        seen_ids.add(pid)
+                        citers.append(_ss_entry_to_paper(citing))
+                        seed_citers += 1
 
             next_offset = data.get("next")
             if next_offset is None or next_offset >= _CITATIONS_MAX_OFFSET:
@@ -377,16 +511,16 @@ def _fetch_recent_citers(seed_papers: list[dict], hours: int) -> list[dict]:
                  seed_citers, seed.get("title", "")[:60])
 
     log.info("Citations: %d recent citing papers total", len(citers))
-    return citers
+    return citers, cites_count
 
 
 # ---------------------------------------------------------------------------
-# Author crawl — recent papers by target authors (h-index > 50 from seeds)
+# Author crawl — recent papers by target authors (h-index > 20 from seeds)
 # ---------------------------------------------------------------------------
 
 def _fetch_target_author_papers(seed_papers: list[dict], hours: int) -> list[dict]:
     """
-    Identify target authors (h-index > 50) from seed papers, then fetch
+    Identify target authors (h-index > 20) from seed papers, then fetch
     their recent papers via GET /author/{id}/papers.
     """
     cutoff = (datetime.now(tz=timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d")
@@ -398,12 +532,12 @@ def _fetch_target_author_papers(seed_papers: list[dict], hours: int) -> list[dic
         for a in (paper.get("authors") or []):
             aid = a.get("authorId", "")
             h = a.get("hIndex") or 0
-            if aid and h > 50 and aid not in seen_aids:
+            if aid and h > 20 and aid not in seen_aids:
                 seen_aids.add(aid)
                 target_authors.append((aid, a.get("name", "")))
 
     if not target_authors:
-        log.info("Author crawl: no target authors (h-index > 50) found in seeds")
+        log.info("Author crawl: no target authors (h-index > 20) found in seeds")
         return []
 
     log.info("Author crawl: checking %d target authors", len(target_authors))
@@ -470,14 +604,14 @@ def fetch_recent_papers(
     Discover recent papers via three channels:
       1. SS bulk keyword search (broad discovery).
       2. SS citation crawl (papers citing any seed, within time window).
-      3. SS author crawl (recent papers by target authors with h-index > 50).
+      3. SS author crawl (recent papers by target authors with h-index > 20).
     Results are merged and deduplicated.
     """
     # Channel 1: keyword search from config.yaml
     search_papers = _search_recent(hours)
 
-    # Channel 2: citation crawl
-    citer_papers = _fetch_recent_citers(seed_papers, hours)
+    # Channel 2: citation crawl (also returns per-paper seed citation counts)
+    citer_papers, cites_count = _fetch_recent_citers(seed_papers, hours)
 
     # Channel 3: target author recent papers
     author_papers = _fetch_target_author_papers(seed_papers, hours)
@@ -517,6 +651,12 @@ def fetch_recent_papers(
         and p.get("ss_id", "") not in seed_ss
     ]
 
+    # Annotate papers with seed citation counts from the citation crawl
+    for p in candidates:
+        pid = p.get("ss_id") or ""
+        if pid in cites_count:
+            p["_cites_seed_count"] = cites_count[pid]
+
     log.info("Discovery: %d search + %d citations + %d authors → %d candidates",
              len(search_papers), added_from_citations, added_from_authors,
              len(candidates))
@@ -527,13 +667,14 @@ def fetch_recent_papers(
 # Batch enrichment — references + author h-index/affiliations
 # ---------------------------------------------------------------------------
 
-def enrich_with_ss(papers: list[dict]) -> None:
+def enrich_with_ss(papers: list[dict], skip_references: bool = False) -> None:
     """
     Batch-enrich papers in place:
-      - POST /paper/batch  → references (500 IDs/call)
+      - POST /paper/batch  → references (500 IDs/call)  [unless skip_references]
       - POST /author/batch → h-index + affiliations (1000 IDs/call)
 
     Papers must have either 'ss_id' or 'arxiv_id' set.
+    Use skip_references=True for candidates (references are not used in scoring).
     """
     # Build query ID list (prefer ss_id, fall back to ARXIV:id)
     query_ids: list[tuple[int, str]] = []   # (index, query_id)
@@ -545,35 +686,41 @@ def enrich_with_ss(papers: list[dict]) -> None:
     if not query_ids:
         return
 
-    # --- Step 1: batch fetch references ---
-    ref_fields = "paperId,references.title,references.authors"
-    ref_map: dict[str, dict] = {}
-    id_list = [qid for _, qid in query_ids]
+    # --- Step 1: batch fetch references (skippable) ---
+    ref_count = 0
+    if not skip_references:
+        ref_fields = "paperId,references.title,references.authors"
+        ref_map: dict[str, dict] = {}
+        id_list = [qid for _, qid in query_ids]
 
-    for i in range(0, len(id_list), _SS_BATCH_LIMIT):
-        chunk = id_list[i: i + _SS_BATCH_LIMIT]
-        data = _ss_post(
-            f"{_SS_BASE}/paper/batch",
-            json={"ids": chunk},
-            params={"fields": ref_fields},
-        )
-        if not data:
-            continue
-        for entry, qid in zip(data, chunk):
-            if entry:
-                ref_map[qid] = entry
+        for i in range(0, len(id_list), _SS_BATCH_LIMIT):
+            chunk = id_list[i: i + _SS_BATCH_LIMIT]
+            data = _ss_post(
+                f"{_SS_BASE}/paper/batch",
+                json={"ids": chunk},
+                params={"fields": ref_fields},
+            )
+            if not data:
+                continue
+            for entry, qid in zip(data, chunk):
+                if entry:
+                    ref_map[qid] = entry
 
-    for idx, qid in query_ids:
-        entry = ref_map.get(qid)
-        if not entry:
-            continue
-        papers[idx]["references"] = [
-            {
-                "title":   r.get("title") or "",
-                "authors": [{"name": a.get("name", "")} for a in (r.get("authors") or [])],
-            }
-            for r in (entry.get("references") or [])
-        ]
+        for idx, qid in query_ids:
+            entry = ref_map.get(qid)
+            if not entry:
+                continue
+            papers[idx]["references"] = [
+                {
+                    "title":   r.get("title") or "",
+                    "authors": [
+                        {"name": a.get("name", ""), "authorId": a.get("authorId") or ""}
+                        for a in (r.get("authors") or [])
+                    ],
+                }
+                for r in (entry.get("references") or [])
+            ]
+        ref_count = len(ref_map)
 
     # --- Step 2: batch fetch author details ---
     all_author_ids: set[str] = set()
@@ -609,4 +756,4 @@ def enrich_with_ss(papers: list[dict]) -> None:
                 a["affiliations"] = details["affiliations"]
 
     log.info("Enriched %d papers: %d with refs, %d authors resolved",
-             len(papers), len(ref_map), len(author_map))
+             len(papers), ref_count, len(author_map))

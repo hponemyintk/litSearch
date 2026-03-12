@@ -9,13 +9,15 @@ Usage:
 import argparse
 import logging
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 from fetcher import (
     load_seed_urls, fetch_seed_papers, fetch_recent_papers,
     enrich_with_ss, configure_api_key,
 )
-from scorer import build_scoring_config, rank_papers
+from scorer import build_scoring_config, precompute_similarities, rank_papers
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,9 +27,10 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def format_paper(rank: int, paper: dict) -> str:
+def format_paper(rank: int, paper: dict, config: dict) -> str:
     """Format a single ranked paper as a human-readable text block."""
     bd = paper.get("score_breakdown", {})
+    mt = bd.get("max_total", config.get("max_total", 100))
     lines = [
         f"{'='*70}",
         f"#{rank}  {paper.get('title', 'Untitled')}",
@@ -36,7 +39,15 @@ def format_paper(rank: int, paper: dict) -> str:
         f"Authors: {', '.join(a.get('name','?') for a in (paper.get('authors') or [])[:5])}",
         f"Categories: {', '.join(paper.get('categories') or [])}",
         f"",
-        f"SCORE: {bd.get('summary', 'N/A')}",
+        f"TOTAL SCORE: {bd.get('total', 0)}/{mt}",
+        f"  Semantic Similarity:    {bd.get('semantic', 0):>3}/{config.get('max_semantic', 35)}",
+        f"  Author in Seed Refs:    {bd.get('seed_ref', 0):>3}/{config.get('max_seed_ref_author', 10)}",
+        f"  Cites Seed:             {bd.get('cites_seed', 0):>3}/{config.get('max_cites_seed', 15)}",
+        f"  Author Authority:       {bd.get('authority', 0):>3}/{config.get('max_authority', 9)}",
+        f"  Citation Velocity:      {bd.get('velocity', 0):>3}/{config.get('max_citation_vel', 12)}",
+        f"  Institutional Auth:     {bd.get('institution', 0):>3}/{config.get('flat_institution', 5)}",
+        f"  Category Intersection:  {bd.get('cross_cat', 0):>3}/{config.get('flat_cross_cat', 5)}",
+        f"  Benchmark Specificity:  {bd.get('benchmark', 0):>3}/{config.get('max_benchmark', 9)}",
         f"",
         f"Abstract:",
         (paper.get("abstract") or "N/A")[:600] + ("..." if len(paper.get("abstract") or "") > 600 else ""),
@@ -47,12 +58,13 @@ def format_paper(rank: int, paper: dict) -> str:
 
 
 def run_pipeline(input_file: str, days: int, output_file: str, enrich: bool) -> None:
+    wall_start = time.monotonic()
     log.info("Loading seed papers from: %s", input_file)
     seed_ids = load_seed_urls(input_file)
     if not seed_ids:
-        log.error("No valid arXiv IDs found in %s", input_file)
+        log.error("No valid paper IDs found in %s", input_file)
         sys.exit(1)
-    log.info("Loaded %d seed arXiv IDs", len(seed_ids))
+    log.info("Loaded %d seed paper IDs", len(seed_ids))
 
     hours = days * 24
 
@@ -71,11 +83,10 @@ def run_pipeline(input_file: str, days: int, output_file: str, enrich: bool) -> 
     log.info("Building dynamic scoring config from %d seed papers...", len(seed_papers))
     config = build_scoring_config(seed_papers, window_hours=hours)
     log.info(
-        "Config: %d keywords, %d target authors, %d ref topics, %d seed-ref authors",
-        len(config["keyword_weights"]),
-        len(config["target_authors"]),
-        len(config["target_topics"]),
-        len(config["seed_ref_authors"]),
+        "Config: %d seed embeddings, %d seed-ref author IDs, sim threshold=%.3f",
+        config["_seed_embeddings"].shape[0],
+        len(config["seed_ref_author_ids"]),
+        config["_sim_threshold"],
     )
 
     # 1-3 SS search calls — discover recent papers
@@ -84,35 +95,63 @@ def run_pipeline(input_file: str, days: int, output_file: str, enrich: bool) -> 
     log.info("Found %d candidate papers", len(papers))
 
     if not papers:
+        elapsed = time.monotonic() - wall_start
+        minutes, seconds = divmod(elapsed, 60)
         log.warning("No papers found in the last %d-day window", days)
+        log.info("Wall time: %dm %.1fs", int(minutes), seconds)
         Path(output_file).write_text("No papers found.\n", encoding="utf-8")
         return
 
-    # 2-4 SS batch calls — references + author h-index for candidates
+    # Batch calls — author h-index/affiliations for candidates (skip references)
     if enrich:
-        log.info("Enriching %d candidates (refs + h-index)...", len(papers))
-        enrich_with_ss(papers)
+        log.info("Enriching %d candidates (h-index + affiliations)...", len(papers))
+        enrich_with_ss(papers, skip_references=True)
+    else:
+        log.warning(
+            "--no-enrich: author authority (max %d), institutional (max %d), "
+            "and seed-ref matching (max %d) will be degraded — %d/%d pts unreachable",
+            config.get("max_authority", 9),
+            config.get("flat_institution", 5),
+            config.get("max_seed_ref_author", 10),
+            config.get("max_authority", 9) + config.get("flat_institution", 5)
+            + config.get("max_seed_ref_author", 10),
+            config.get("max_total", 100),
+        )
+
+    log.info("Computing semantic similarities...")
+    precompute_similarities(papers, config)
 
     log.info("Scoring and ranking papers...")
     ranked = rank_papers(papers, config)
 
+    elapsed = time.monotonic() - wall_start
+    minutes, seconds = divmod(elapsed, 60)
+    wall_str = f"{int(minutes)}m {seconds:.1f}s"
+
     out_lines = [
         f"Daily Paper Discovery Report",
         f"Seed papers: {len(seed_ids)} | Candidates scored: {len(ranked)} | Window: last {days}d",
-        f"Generated: {__import__('datetime').datetime.now().isoformat()}",
+        f"Generated: {datetime.now().isoformat()}",
         "",
     ]
     for i, paper in enumerate(ranked, start=1):
-        out_lines.append(format_paper(i, paper))
+        out_lines.append(format_paper(i, paper, config))
+    out_lines.append(f"Wall time: {wall_str}")
 
     output = "\n".join(out_lines)
     Path(output_file).write_text(output, encoding="utf-8")
     log.info("Results written to: %s", output_file)
+    log.info("Wall time: %s", wall_str)
 
-    print(f"\n--- {len(ranked)} Papers (ranked) ---")
-    for i, paper in enumerate(ranked, start=1):
+    top_n = min(30, len(ranked))
+    print(f"\n--- Top {top_n} of {len(ranked)} Papers (ranked) ---")
+    for i, paper in enumerate(ranked[:30], start=1):
         bd = paper.get("score_breakdown", {})
-        print(f"  #{i:<3} [{bd.get('total','?'):>3}/100] {paper.get('title','')[:75]}")
+        mt = bd.get('max_total', 100)
+        print(f"  #{i:<3} [{bd.get('total','?'):>3}/{mt}] {paper.get('title','')[:75]}")
+    if len(ranked) > 30:
+        print(f"  ... and {len(ranked) - 30} more (see {output_file})")
+    print(f"\nWall time: {wall_str}")
 
 
 def main() -> None:
@@ -121,15 +160,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--input", "-i", required=True,
-        help="Path to text file containing arXiv URLs/IDs (one per line)."
+        help="Path to text file with paper URLs/IDs (arXiv, DOI, Nature, PubMed, etc.)."
     )
     parser.add_argument(
         "--days", "-t", type=int, default=7,
         help="Look back window in days (default: 7)."
     )
     parser.add_argument(
-        "--output", "-o", default="results.txt",
-        help="Output file path (default: results.txt)."
+        "--output", "-o", default=None,
+        help="Output file path (default: YYYY_MM_dd_Nd_output.txt)."
     )
     parser.add_argument(
         "--no-enrich", action="store_true",
@@ -142,7 +181,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.api_key:
         configure_api_key(args.api_key)
-    run_pipeline(args.input, args.days, args.output, enrich=not args.no_enrich)
+    output = args.output or f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.days}d_output.txt"
+    run_pipeline(args.input, args.days, output, enrich=not args.no_enrich)
 
 
 if __name__ == "__main__":

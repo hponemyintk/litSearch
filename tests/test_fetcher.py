@@ -1,7 +1,7 @@
 """
 Unit tests for fetcher.py URL resolution.
 These tests cover the parsing/pattern logic only — no live network calls.
-Run with: python -m pytest test_fetcher.py -v
+Run with: python -m pytest tests/test_fetcher.py -v
 """
 import pytest
 from fetcher import (

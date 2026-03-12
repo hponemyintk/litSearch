@@ -1,6 +1,6 @@
 """
 Unit tests for scorer.py (9 heuristics + config builder + aggregation).
-Run with: python -m pytest test_scorer.py -v
+Run with: python -m pytest tests/test_scorer.py -v
 """
 import pytest
 from datetime import datetime, timedelta, timezone
