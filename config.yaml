@@ -1,0 +1,14 @@
+keyword_weights:
+  relational foundation model: 5
+  relational transformer: 5
+  tabular foundation model: 5
+  tabular transformer: 5
+  tabpfn: 5
+  relational deep learning: 3
+  graph transformer: 3
+  synthetic data: 3
+  transformer: 2
+  in-context learning: 2
+  heterogeneous graph: 2
+  message passing: 2
+  relational: 2
