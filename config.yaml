@@ -1,5 +1,6 @@
 keywords:
   - relational foundation model
+  - relational deep learning
   - relational transformer
   - tabular foundation model
   - tabular transformer
@@ -14,16 +15,19 @@ keywords:
   - relational
 
 scoring:
-  max_semantic: 35
-  max_seed_ref_author: 7
+  max_semantic: 37
+  max_seed_ref_author: 6
   seed_ref_per_author: 4
-  max_cites_seed: 10
-  cites_seed_per_seed: 5
+  max_cites_seed: 8
+  cites_seed_per_seed: 3
   flat_ref_by_seed: 5
-  max_authority: 10
-  max_citation_vel: 18
+  max_authority: 8
+  max_citation_vel: 17
   flat_institution: 5
-  max_benchmark: 10
+  max_benchmark: 7
+  venue_prestige_tier1: 7
+  venue_prestige_tier2: 4
+  venue_prestige_workshop: 2
 
 institutions:
   # US universities
@@ -102,3 +106,56 @@ benchmarks:
   - OpenML
   - TabZilla
   - WILDS
+
+# Venue prestige tiers (main track vs workshop detected automatically)
+# Tier 1: top ML conferences + top science journals (8 pts main, 2 pts workshop)
+venues_tier1:
+  # Top ML conferences
+  - NeurIPS
+  - Neural Information Processing Systems
+  - ICML
+  - International Conference on Machine Learning
+  - ICLR
+  - International Conference on Learning Representations
+  # Top science journals
+  - Nature
+  - Science
+  - PNAS
+  - Proceedings of the National Academy of Sciences
+  # Top ML journals
+  - JMLR
+  - Journal of Machine Learning Research
+  - TPAMI
+  - IEEE Transactions on Pattern Analysis and Machine Intelligence
+
+# Tier 2: strong conferences/journals (5 pts main, 2 pts workshop)
+venues_tier2:
+  # AI conferences
+  - AAAI
+  - IJCAI
+  # Vision
+  - CVPR
+  - ECCV
+  - ICCV
+  # NLP
+  - ACL
+  - EMNLP
+  - NAACL
+  # Data / systems
+  - KDD
+  - SIGMOD
+  - VLDB
+  - WWW
+  - WSDM
+  - SIGIR
+  - CIKM
+  - RecSys
+  # Robotics
+  - ICRA
+  - RSS
+  - CoRL
+  # Journals
+  - Artificial Intelligence
+  - Machine Learning
+  - IEEE Transactions on Neural Networks
+  - Neural Networks

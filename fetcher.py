@@ -7,6 +7,11 @@ All API calls use SS batch/bulk endpoints for efficiency:
   - Enrich:    POST /paper/batch       (references, 500/call)
                POST /author/batch      (h-index, 1000/call)
 
+The three discovery channels (keyword search, citation crawl, author crawl)
+run concurrently via ThreadPoolExecutor.  A shared rate limiter serialises
+the actual HTTP calls to stay within Semantic Scholar's rate limits while
+overlapping I/O wait with result processing to minimise total wall time.
+
 Typical run (4 seeds, 500 candidates): ~8 SS API calls total.
 """
 
@@ -14,6 +19,8 @@ import os
 import re
 import time
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -30,7 +37,7 @@ log = logging.getLogger(__name__)
 _SS_BASE         = "https://api.semanticscholar.org/graph/v1"
 _SS_BATCH_LIMIT  = 500    # max IDs per POST /paper/batch
 _SS_AUTHOR_BATCH = 1000   # max IDs per POST /author/batch
-_SS_LEEWAY_KEY   = 1.5    # seconds between calls (with API key)
+_SS_LEEWAY_KEY   = 1.0    # seconds between calls (with API key)
 _SS_LEEWAY_FREE  = 3.5    # seconds between calls (no API key — stricter limits)
 _SS_MAX_429      = 8       # max consecutive 429s before giving up
 
@@ -56,6 +63,42 @@ def _leeway() -> float:
 
 
 # ---------------------------------------------------------------------------
+# Thread-safe rate limiter — only sleeps the *remaining* gap since last call.
+# When running discovery channels concurrently this eliminates wasted idle
+# time: while one thread processes results, another can issue its request.
+# ---------------------------------------------------------------------------
+
+class _RateLimiter:
+    __slots__ = ("_lock", "_last_call")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last_call = 0.0
+
+    def wait(self) -> None:
+        gap = _leeway()
+        with self._lock:
+            now = time.monotonic()
+            remaining = gap - (now - self._last_call)
+            if remaining > 0:
+                time.sleep(remaining)
+            self._last_call = time.monotonic()
+
+_rate_limiter = _RateLimiter()
+
+# Per-thread sessions — requests.Session is NOT thread-safe, so each
+# thread gets its own session (still benefits from connection pooling
+# within that thread's sequence of calls).
+_thread_local = threading.local()
+
+
+def _get_session() -> requests.Session:
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = requests.Session()
+    return _thread_local.session
+
+
+# ---------------------------------------------------------------------------
 # HTTP helpers with retry + 429 handling + leeway
 #
 # 429 rate limits do NOT consume error retries — they are expected behaviour
@@ -64,14 +107,17 @@ def _leeway() -> float:
 # ---------------------------------------------------------------------------
 
 def _ss_get(url: str, params: dict | None = None, retries: int = 4):
-    """GET with retry, 429 back-off, and leeway sleep."""
+    """GET with retry, 429 back-off, and rate-limited pacing."""
     gap = _leeway()
     attempt = 0
     rate_hits = 0
     while attempt < retries:
         try:
-            resp = requests.get(url, params=params,
-                                headers=_ss_headers(), timeout=90)
+            _rate_limiter.wait()
+            resp = _get_session().get(
+                url, params=params, headers=_ss_headers(),
+                timeout=(10, 90),   # (connect, read)
+            )
             if resp.status_code == 429:
                 rate_hits += 1
                 if rate_hits > _SS_MAX_429:
@@ -83,7 +129,6 @@ def _ss_get(url: str, params: dict | None = None, retries: int = 4):
                 time.sleep(wait)
                 continue   # retry WITHOUT incrementing attempt
             resp.raise_for_status()
-            time.sleep(gap)
             return resp.json()
         except requests.RequestException as exc:
             attempt += 1
@@ -94,14 +139,17 @@ def _ss_get(url: str, params: dict | None = None, retries: int = 4):
 
 
 def _ss_post(url: str, json: dict, params: dict | None = None, retries: int = 4):
-    """POST with retry, 429 back-off, and leeway sleep."""
+    """POST with retry, 429 back-off, and rate-limited pacing."""
     gap = _leeway()
     attempt = 0
     rate_hits = 0
     while attempt < retries:
         try:
-            resp = requests.post(url, json=json, params=params,
-                                 headers=_ss_headers(), timeout=90)
+            _rate_limiter.wait()
+            resp = _get_session().post(
+                url, json=json, params=params, headers=_ss_headers(),
+                timeout=(10, 180),   # (connect, read) — batch POSTs need more time
+            )
             if resp.status_code == 429:
                 rate_hits += 1
                 if rate_hits > _SS_MAX_429:
@@ -113,7 +161,6 @@ def _ss_post(url: str, json: dict, params: dict | None = None, retries: int = 4)
                 time.sleep(wait)
                 continue   # retry WITHOUT incrementing attempt
             resp.raise_for_status()
-            time.sleep(gap)
             return resp.json()
         except requests.RequestException as exc:
             attempt += 1
@@ -172,6 +219,10 @@ def _ss_entry_to_paper(entry: dict, arxiv_id: str = "") -> dict:
     if not arxiv_id:
         arxiv_id = (entry.get("externalIds") or {}).get("ArXiv") or ""
 
+    # Extract venue name from publicationVenue (structured) or venue (string)
+    pub_venue = entry.get("publicationVenue") or {}
+    venue = pub_venue.get("name") or entry.get("venue") or ""
+
     return {
         "source_id":               f"ARXIV:{arxiv_id}" if arxiv_id else entry.get("paperId", ""),
         "arxiv_id":                arxiv_id,
@@ -179,6 +230,7 @@ def _ss_entry_to_paper(entry: dict, arxiv_id: str = "") -> dict:
         "title":                   entry.get("title") or "",
         "abstract":                entry.get("abstract") or "",
         "published":               entry.get("publicationDate") or "",
+        "venue":                   venue,
         "authors": [
             {
                 "name":         a.get("name", ""),
@@ -192,6 +244,7 @@ def _ss_entry_to_paper(entry: dict, arxiv_id: str = "") -> dict:
         "references": [
             {
                 "paperId": r.get("paperId") or "",
+                "arxivId": (r.get("externalIds") or {}).get("ArXiv") or "",
                 "title":   r.get("title") or "",
                 "authors": [
                     {"name": a.get("name", ""), "authorId": a.get("authorId") or ""}
@@ -346,8 +399,8 @@ load_seed_ids = load_seed_urls
 
 _SEED_FIELDS = (
     "paperId,externalIds,title,abstract,publicationDate,"
-    "s2FieldsOfStudy,authors,"
-    "references.paperId,references.title,references.authors,"
+    "s2FieldsOfStudy,authors,venue,publicationVenue,"
+    "references.paperId,references.title,references.authors,references.externalIds,"
     "citationCount,influentialCitationCount"
 )
 
@@ -401,7 +454,8 @@ def _build_search_query() -> str:
 
 _SEARCH_FIELDS = (
     "paperId,externalIds,title,abstract,publicationDate,"
-    "s2FieldsOfStudy,authors,citationCount,influentialCitationCount"
+    "s2FieldsOfStudy,authors,venue,publicationVenue,"
+    "citationCount,influentialCitationCount"
 )
 
 
@@ -608,14 +662,17 @@ def fetch_recent_papers(
       3. SS author crawl (recent papers by target authors with h-index > 20).
     Results are merged and deduplicated.
     """
-    # Channel 1: keyword search from config.yaml
-    search_papers = _search_recent(hours)
+    # Run all three discovery channels concurrently.
+    # The shared _rate_limiter serialises HTTP calls to respect the API
+    # rate limit, while threads overlap I/O wait with result processing.
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="discovery") as pool:
+        f_search = pool.submit(_search_recent, hours)
+        f_cite   = pool.submit(_fetch_recent_citers, seed_papers, hours)
+        f_author = pool.submit(_fetch_target_author_papers, seed_papers, hours)
 
-    # Channel 2: citation crawl (also returns per-paper seed citation counts)
-    citer_papers, cites_count = _fetch_recent_citers(seed_papers, hours)
-
-    # Channel 3: target author recent papers
-    author_papers = _fetch_target_author_papers(seed_papers, hours)
+        search_papers = f_search.result()
+        citer_papers, cites_count = f_cite.result()
+        author_papers = f_author.result()
 
     # Merge + deduplicate (prefer search version if duplicate)
     seen: set[str] = set()
@@ -690,7 +747,7 @@ def enrich_with_ss(papers: list[dict], skip_references: bool = False) -> None:
     # --- Step 1: batch fetch references (skippable) ---
     ref_count = 0
     if not skip_references:
-        ref_fields = "paperId,references.title,references.authors"
+        ref_fields = "paperId,references.paperId,references.title,references.authors,references.externalIds"
         ref_map: dict[str, dict] = {}
         id_list = [qid for _, qid in query_ids]
 
@@ -713,6 +770,8 @@ def enrich_with_ss(papers: list[dict], skip_references: bool = False) -> None:
                 continue
             papers[idx]["references"] = [
                 {
+                    "paperId": r.get("paperId") or "",
+                    "arxivId": (r.get("externalIds") or {}).get("ArXiv") or "",
                     "title":   r.get("title") or "",
                     "authors": [
                         {"name": a.get("name", ""), "authorId": a.get("authorId") or ""}

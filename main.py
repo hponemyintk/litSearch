@@ -37,17 +37,19 @@ def format_paper(rank: int, paper: dict, config: dict) -> str:
         f"arXiv: {paper.get('arxiv_id', 'N/A')}",
         f"Published: {paper.get('published', 'unknown')}",
         f"Authors: {', '.join(a.get('name','?') for a in (paper.get('authors') or [])[:5])}",
+        f"Venue: {paper.get('venue') or 'N/A'}",
         f"Categories: {', '.join(paper.get('categories') or [])}",
         f"",
         f"TOTAL SCORE: {bd.get('total', 0)}/{mt}",
         f"  Semantic Similarity:    {bd.get('semantic', 0):>3}/{config.get('max_semantic', 35)}",
-        f"  Author in Seed Refs:    {bd.get('seed_ref', 0):>3}/{config.get('max_seed_ref_author', 7)}",
+        f"  Seed Author:            {bd.get('seed_ref', 0):>3}/{config.get('max_seed_ref_author', 7)}",
         f"  Cites Seed:             {bd.get('cites_seed', 0):>3}/{config.get('max_cites_seed', 8)}",
         f"  Referenced by Seed:     {bd.get('ref_by_seed', 0):>3}/{config.get('flat_ref_by_seed', 5)}",
         f"  Author Authority:       {bd.get('authority', 0):>3}/{config.get('max_authority', 10)}",
         f"  Citation Velocity:      {bd.get('velocity', 0):>3}/{config.get('max_citation_vel', 20)}",
         f"  Institutional Auth:     {bd.get('institution', 0):>3}/{config.get('flat_institution', 5)}",
         f"  Benchmark Specificity:  {bd.get('benchmark', 0):>3}/{config.get('max_benchmark', 10)}",
+        f"  Venue Prestige:         {bd.get('venue', 0):>3}/{config.get('venue_prestige_tier1', 8)}",
         f"",
         f"Abstract:",
         (paper.get("abstract") or "N/A")[:600] + ("..." if len(paper.get("abstract") or "") > 600 else ""),
@@ -57,7 +59,8 @@ def format_paper(rank: int, paper: dict, config: dict) -> str:
     return "\n".join(lines)
 
 
-def run_pipeline(input_file: str, days: int, output_file: str, enrich: bool) -> None:
+def run_pipeline(input_file: str, days: int, output_file: str, enrich: bool,
+                  semantic_only: bool = False) -> None:
     wall_start = time.monotonic()
     log.info("Loading seed papers from: %s", input_file)
     seed_ids = load_seed_urls(input_file)
@@ -83,9 +86,10 @@ def run_pipeline(input_file: str, days: int, output_file: str, enrich: bool) -> 
     log.info("Building dynamic scoring config from %d seed papers...", len(seed_papers))
     config = build_scoring_config(seed_papers, window_hours=hours)
     log.info(
-        "Config: %d seed embeddings, %d seed-ref author IDs, sim threshold=%.3f",
+        "Config: %d seed embeddings, %d seed author IDs, %d seed ref papers, sim threshold=%.3f",
         config["_seed_embeddings"].shape[0],
-        len(config["seed_ref_author_ids"]),
+        len(config["seed_author_ids"]),
+        len(config["seed_ref_paper_ids"]),
         config["_sim_threshold"],
     )
 
@@ -121,8 +125,9 @@ def run_pipeline(input_file: str, days: int, output_file: str, enrich: bool) -> 
     log.info("Computing semantic similarities...")
     precompute_similarities(papers, config)
 
-    log.info("Scoring and ranking papers...")
-    ranked = rank_papers(papers, config)
+    mode = "semantic-only" if semantic_only else "full"
+    log.info("Scoring and ranking papers (mode=%s)...", mode)
+    ranked = rank_papers(papers, config, semantic_only=semantic_only)
 
     elapsed = time.monotonic() - wall_start
     minutes, seconds = divmod(elapsed, 60)
@@ -175,14 +180,21 @@ def main() -> None:
         help="Skip author/reference enrichment (faster, less accurate scoring)."
     )
     parser.add_argument(
+        "--semantic-only", action="store_true",
+        help="Rank papers purely by semantic similarity to seed papers."
+    )
+    parser.add_argument(
         "--api-key", default=None,
         help="Semantic Scholar API key (or set SS_API_KEY env var)."
     )
     args = parser.parse_args()
     if args.api_key:
         configure_api_key(args.api_key)
-    output = args.output or f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.days}d_output.txt"
-    run_pipeline(args.input, args.days, output, enrich=not args.no_enrich)
+    input_stem = Path(args.input).stem
+    suffix = "_semantic" if args.semantic_only else ""
+    output = args.output or f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{input_stem}_{args.days}d{suffix}_output.txt"
+    run_pipeline(args.input, args.days, output, enrich=not args.no_enrich,
+                 semantic_only=args.semantic_only)
 
 
 if __name__ == "__main__":

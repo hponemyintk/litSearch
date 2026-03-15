@@ -1,21 +1,26 @@
 """
 scorer.py — semantic similarity + metadata-driven paper scoring engine.
 
-Scores a paper using 8 heuristics (point values configurable via config.yaml):
+Scores a paper using 9 heuristics (point values configurable via config.yaml,
+default max total = 100):
 
   Relevance:
-    1. Semantic Similarity          — embedding cosine sim to seeds      (35)
-    2. Author in Seed Refs          — candidate authorId in seed refs    (7)
+    1. Semantic Similarity          — embedding cosine sim to seeds      (37)
+    2. Seed Author                  — candidate author is a seed author  (6)
     3. Cites Seed                   — paper directly cites seed papers   (8)
     4. Referenced by Seed           — paper appears in seed references   (5)
 
   Quality:
-    5. Author Authority             — logarithmic h-index               (10)
-    6. Citation Velocity            — citations/day + recency prior      (20)
+    5. Author Authority             — logarithmic h-index               (8)
+    6. Citation Velocity            — citations/day + recency prior      (17)
 
   Bonuses:
     7. Institutional Authority      — affiliation check                  (5)
-    8. Benchmark Specificity        — dataset names in abstract          (10)
+    8. Benchmark Specificity        — dataset names in abstract          (7)
+    9. Venue Prestige               — top conference/journal bonus       (7)
+
+Venue tiers (venues_tier1, venues_tier2) must be defined in config.yaml;
+no hard-coded defaults are provided.
 
 Call build_scoring_config(seed_papers, window_hours) once per session,
 then precompute_similarities(candidates, config) before scoring,
@@ -42,16 +47,19 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_SCORING = {
-    "max_semantic": 35,
-    "max_seed_ref_author": 7,
+    "max_semantic": 37,
+    "max_seed_ref_author": 6,
     "seed_ref_per_author": 4,
     "max_cites_seed": 8,
-    "cites_seed_per_seed": 4,
+    "cites_seed_per_seed": 3,
     "flat_ref_by_seed": 5,
-    "max_authority": 10,
-    "max_citation_vel": 20,
+    "max_authority": 8,
+    "max_citation_vel": 17,
     "flat_institution": 5,
-    "max_benchmark": 10,
+    "max_benchmark": 7,
+    "venue_prestige_tier1": 7,
+    "venue_prestige_tier2": 4,
+    "venue_prestige_workshop": 2,
 }
 
 _DEFAULT_INSTITUTIONS: list[str] = [
@@ -80,6 +88,7 @@ _DEFAULT_BENCHMARKS: list[str] = [
     "RelBench", "OGB", "Open Graph Benchmark", "OpenML",
     "TabZilla", "WILDS",
 ]
+
 
 _EMBED_MODEL = "all-MiniLM-L12-v2"
 _DEFAULT_CONFIG = Path(__file__).parent / "config.yaml"
@@ -172,6 +181,8 @@ def build_scoring_config(
 
     institutions = file_cfg.get("institutions", _DEFAULT_INSTITUTIONS)
     benchmarks = file_cfg.get("benchmarks", _DEFAULT_BENCHMARKS)
+    venues_tier1 = file_cfg.get("venues_tier1") or []
+    venues_tier2 = file_cfg.get("venues_tier2") or []
 
     # Load embedding model
     model = SentenceTransformer(_EMBED_MODEL)
@@ -202,6 +213,7 @@ def build_scoring_config(
         sc["max_semantic"] + sc["max_seed_ref_author"] + sc["max_cites_seed"]
         + sc["flat_ref_by_seed"] + sc["max_authority"] + sc["max_citation_vel"]
         + sc["flat_institution"] + sc["max_benchmark"]
+        + sc["venue_prestige_tier1"]
     )
 
     return {
@@ -211,7 +223,7 @@ def build_scoring_config(
         "_sim_threshold":    sim_threshold,
         "_institution_re":   _build_institution_pattern(institutions),
         # author matching (by authorId) + paper matching (by paperId)
-        "seed_ref_author_ids": _extract_seed_ref_author_ids(seed_papers),
+        "seed_author_ids": _extract_seed_author_ids(seed_papers),
         "seed_ref_paper_ids":  _extract_seed_ref_paper_ids(seed_papers),
         # window
         "window_hours":      window_hours,
@@ -220,31 +232,36 @@ def build_scoring_config(
         "max_total":         max_total,
         # lists
         "benchmarks":        benchmarks,
+        "venues_tier1":      venues_tier1,
+        "venues_tier2":      venues_tier2,
     }
 
 
 # -- private helpers ---------------------------------------------------------
 
-def _extract_seed_ref_author_ids(seed_papers: list[dict]) -> set[str]:
-    """Collect unique authorIds from all seed papers' reference lists."""
+def _extract_seed_author_ids(seed_papers: list[dict], min_hindex: int = 20) -> set[str]:
+    """Collect unique authorIds from seed papers (h-index >= min_hindex only)."""
     ids: set[str] = set()
     for paper in seed_papers:
-        for ref in (paper.get("references") or []):
-            for author in (ref.get("authors") or []):
-                aid = (author.get("authorId") or "").strip()
-                if aid:
-                    ids.add(aid)
+        for author in (paper.get("authors") or []):
+            aid = (author.get("authorId") or "").strip()
+            h = author.get("hIndex") or 0
+            if aid and h >= min_hindex:
+                ids.add(aid)
     return ids
 
 
 def _extract_seed_ref_paper_ids(seed_papers: list[dict]) -> set[str]:
-    """Collect unique paperIds from all seed papers' reference lists."""
+    """Collect unique paperIds AND arxiv IDs from all seed papers' reference lists."""
     ids: set[str] = set()
     for paper in seed_papers:
         for ref in (paper.get("references") or []):
             pid = (ref.get("paperId") or "").strip()
             if pid:
                 ids.add(pid)
+            arxiv = (ref.get("arxivId") or "").strip()
+            if arxiv:
+                ids.add(arxiv)
     return ids
 
 
@@ -344,7 +361,7 @@ def score_semantic_similarity(paper: dict[str, Any], config: dict[str, Any]) -> 
 
 
 # ---------------------------------------------------------------------------
-# Heuristic 2: Author in Seed References (by authorId)
+# Heuristic 2: Seed Author (by authorId)
 # ---------------------------------------------------------------------------
 
 def score_author_in_seed_refs(
@@ -352,10 +369,10 @@ def score_author_in_seed_refs(
     config: dict[str, Any],
 ) -> int:
     """
-    Award points per candidate author whose SS authorId appears
-    in the seed papers' reference author lists.
+    Award points per candidate author whose SS authorId matches
+    a seed paper author (i.e. same person authored both).
     """
-    seed_ref_ids = config.get("seed_ref_author_ids") or set()
+    seed_ref_ids = config.get("seed_author_ids") or set()
     if not seed_ref_ids:
         return 0
     per_author = config.get("seed_ref_per_author", _DEFAULT_SCORING["seed_ref_per_author"])
@@ -391,15 +408,19 @@ def score_cites_seed(paper: dict[str, Any], config: dict[str, Any]) -> int:
 
 def score_referenced_by_seed(paper: dict[str, Any], config: dict[str, Any]) -> int:
     """
-    Flat points if this paper's SS paperId appears in any seed paper's
-    reference list (i.e. a seed paper cites this candidate).
+    Flat points if this paper's SS paperId or arxiv ID appears in any
+    seed paper's reference list (i.e. a seed paper cites this candidate).
     """
     seed_ref_pids = config.get("seed_ref_paper_ids") or set()
     if not seed_ref_pids:
         return 0
+    flat = config.get("flat_ref_by_seed", _DEFAULT_SCORING["flat_ref_by_seed"])
     pid = (paper.get("ss_id") or "").strip()
     if pid and pid in seed_ref_pids:
-        return config.get("flat_ref_by_seed", _DEFAULT_SCORING["flat_ref_by_seed"])
+        return flat
+    aid = (paper.get("arxiv_id") or "").strip()
+    if aid and aid in seed_ref_pids:
+        return flat
     return 0
 
 
@@ -546,6 +567,48 @@ def score_benchmark_specificity(
 
 
 # ---------------------------------------------------------------------------
+# Heuristic 9: Venue Prestige (conference tier + workshop detection)
+# ---------------------------------------------------------------------------
+
+def score_venue_prestige(
+    paper: dict[str, Any],
+    config: dict[str, Any],
+) -> int:
+    """
+    Award points based on publication venue prestige.
+
+    Tier 1 main track → venue_prestige_tier1 pts  (default 8)
+    Tier 2 main track → venue_prestige_tier2 pts  (default 5)
+    Workshop at any tier → venue_prestige_workshop pts (default 2)
+    No match → 0
+
+    Workshop detection: case-insensitive "workshop" in venue string.
+    """
+    venue = (paper.get("venue") or "").strip()
+    if not venue:
+        return 0
+
+    venue_lower = venue.lower()
+    is_workshop = "workshop" in venue_lower
+
+    tier1 = config.get("venues_tier1") or []
+    tier2 = config.get("venues_tier2") or []
+    pts_t1 = config.get("venue_prestige_tier1", _DEFAULT_SCORING["venue_prestige_tier1"])
+    pts_t2 = config.get("venue_prestige_tier2", _DEFAULT_SCORING["venue_prestige_tier2"])
+    pts_ws = config.get("venue_prestige_workshop", _DEFAULT_SCORING["venue_prestige_workshop"])
+
+    for name in tier1:
+        if name.lower() in venue_lower:
+            return pts_ws if is_workshop else pts_t1
+
+    for name in tier2:
+        if name.lower() in venue_lower:
+            return pts_ws if is_workshop else pts_t2
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
 
@@ -566,13 +629,14 @@ def score_paper(paper: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]
     vel   = score_citation_velocity(paper, config)
     inst  = score_institutional_authority(authors, config)
     bench = score_benchmark_specificity(abstract, config)
+    venue = score_venue_prestige(paper, config)
 
-    total = min(sem + sref + cseed + rbs + auth + vel + inst + bench, max_total)
+    total = min(sem + sref + cseed + rbs + auth + vel + inst + bench + venue, max_total)
 
     summary = (
         f"Total: {total}/{max_total} | "
         f"Sem: {sem}, SRef: {sref}, Cite: {cseed}, RefBy: {rbs}, Auth: {auth}, "
-        f"Vel: {vel}, Inst: {inst}, Bench: {bench}"
+        f"Vel: {vel}, Inst: {inst}, Bench: {bench}, Venue: {venue}"
     )
 
     result = copy.copy(paper)
@@ -587,6 +651,7 @@ def score_paper(paper: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]
         "velocity":      vel,
         "institution":   inst,
         "benchmark":     bench,
+        "venue":         venue,
         "summary":       summary,
     }
     return result
@@ -595,8 +660,16 @@ def score_paper(paper: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]
 def rank_papers(
     candidates: list[dict[str, Any]],
     config: dict[str, Any],
+    semantic_only: bool = False,
 ) -> list[dict[str, Any]]:
-    """Score all candidates and return sorted by total score descending."""
+    """Score all candidates and return sorted descending.
+
+    If semantic_only=True, rank purely by pre-computed semantic similarity
+    (still computes full breakdown for display).
+    """
     scored = [score_paper(p, config) for p in candidates]
-    scored.sort(key=lambda p: p["score_breakdown"]["total"], reverse=True)
+    if semantic_only:
+        scored.sort(key=lambda p: p.get("_semantic_sim", 0.0), reverse=True)
+    else:
+        scored.sort(key=lambda p: p["score_breakdown"]["total"], reverse=True)
     return scored
