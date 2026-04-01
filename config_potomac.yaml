@@ -1,0 +1,155 @@
+keywords:
+  - intent
+  - intent detection
+  - automated topic modeling
+  - text clustering
+  - zero-shot text classification
+  - llms as annotators
+  - llms as data labelers
+  - automated taxonomy generation
+  - taxonomy construction
+  - topic modeling
+  - zero-shot
+
+scoring:
+  max_semantic: 37
+  max_seed_ref_author: 6
+  seed_ref_per_author: 4
+  max_cites_seed: 8
+  cites_seed_per_seed: 3
+  flat_ref_by_seed: 5
+  max_authority: 8
+  max_citation_vel: 17
+  flat_institution: 5
+  max_benchmark: 7
+  venue_prestige_tier1: 7
+  venue_prestige_tier2: 4
+  venue_prestige_workshop: 2
+
+institutions:
+  # US universities
+  - Stanford
+  - MIT
+  - Berkeley
+  - Carnegie Mellon
+  - CMU
+  - Princeton
+  - Harvard
+  - Cornell
+  - Yale
+  - Columbia
+  - University of Washington
+  - Georgia Tech
+  - UCLA
+  - NYU
+  - University of Michigan
+  - UIUC
+  - University of Illinois
+  - Caltech
+  # European universities
+  - Oxford
+  - Cambridge
+  - UCL
+  - Imperial College
+  - Edinburgh
+  - ETH
+  - EPFL
+  - Tübingen
+  - Max Planck
+  - TU Munich
+  - University of Amsterdam
+  - INRIA
+  # Canadian
+  - Mila
+  - University of Toronto
+  - University of Montreal
+  - McGill
+  # Asian
+  - Tsinghua
+  - Peking University
+  - KAIST
+  - University of Tokyo
+  - NUS
+  - National University of Singapore
+  - HKUST
+  # Industry labs
+  - Google
+  - DeepMind
+  - Meta
+  - FAIR
+  - Microsoft Research
+  - Microsoft
+  - OpenAI
+  - Anthropic
+  - Apple
+  - NVIDIA
+  - Amazon
+  - IBM Research
+  - Allen Institute
+  - AI2
+  - Hugging Face
+  - HuggingFace
+  - Alibaba
+  - DAMO
+  - Baidu
+  - ByteDance
+  - Samsung
+  - Tesla
+
+benchmarks:
+  - Snips
+  - CLINC150
+  - MIntRec
+
+# Venue prestige tiers (main track vs workshop detected automatically)
+# Tier 1: top ML conferences + top science journals (8 pts main, 2 pts workshop)
+venues_tier1:
+  # Top ML conferences
+  - NeurIPS
+  - Neural Information Processing Systems
+  - ICML
+  - International Conference on Machine Learning
+  - ICLR
+  - International Conference on Learning Representations
+  # Top science journals
+  - Nature
+  - Science
+  - PNAS
+  - Proceedings of the National Academy of Sciences
+  # Top ML journals
+  - JMLR
+  - Journal of Machine Learning Research
+  - TPAMI
+  - IEEE Transactions on Pattern Analysis and Machine Intelligence
+
+# Tier 2: strong conferences/journals (5 pts main, 2 pts workshop)
+venues_tier2:
+  # AI conferences
+  - AAAI
+  - IJCAI
+  # Vision
+  - CVPR
+  - ECCV
+  - ICCV
+  # NLP
+  - ACL
+  - EMNLP
+  - NAACL
+  # Data / systems
+  - KDD
+  - SIGMOD
+  - VLDB
+  - WWW
+  - WSDM
+  - SIGIR
+  - CIKM
+  - RecSys
+  # Robotics
+  - ICRA
+  - RSS
+  - CoRL
+  # Journals
+  - Artificial Intelligence
+  - Machine Learning
+  - IEEE Transactions on Neural Networks
+  - Neural Networks
