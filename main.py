@@ -4,6 +4,7 @@ main.py — CLI entrypoint for the daily paper discovery pipeline.
 Usage:
     python main.py --input papers.txt --days 7 --output results.txt
     python main.py --input papers.txt --days 14 --no-enrich
+    python main.py --input papers.txt --days 7 --config config.yaml.bio
 """
 
 import argparse
@@ -60,7 +61,7 @@ def format_paper(rank: int, paper: dict, config: dict) -> str:
 
 
 def run_pipeline(input_file: str, days: int, output_file: str, enrich: bool,
-                  semantic_only: bool = False) -> None:
+                  semantic_only: bool = False, config_path: str | None = None) -> None:
     wall_start = time.monotonic()
     log.info("Loading seed papers from: %s", input_file)
     seed_ids = load_seed_urls(input_file)
@@ -84,7 +85,7 @@ def run_pipeline(input_file: str, days: int, output_file: str, enrich: bool,
         enrich_with_ss(seed_papers)
 
     log.info("Building dynamic scoring config from %d seed papers...", len(seed_papers))
-    config = build_scoring_config(seed_papers, window_hours=hours)
+    config = build_scoring_config(seed_papers, window_hours=hours, config_path=config_path)
     log.info(
         "Config: %d seed embeddings, %d seed author IDs, %d seed ref papers, sim threshold=%.3f",
         config["_seed_embeddings"].shape[0],
@@ -95,7 +96,7 @@ def run_pipeline(input_file: str, days: int, output_file: str, enrich: bool,
 
     # 1-3 SS search calls — discover recent papers
     log.info("Discovering related papers from the last %d days...", days)
-    papers = fetch_recent_papers(seed_papers, hours=hours)
+    papers = fetch_recent_papers(seed_papers, hours=hours, config_path=config_path)
     log.info("Found %d candidate papers", len(papers))
 
     if not papers:
@@ -184,6 +185,10 @@ def main() -> None:
         help="Rank papers purely by semantic similarity to seed papers."
     )
     parser.add_argument(
+        "--config", "-c", default=None,
+        help="Path to config YAML file (default: config.yaml in project dir)."
+    )
+    parser.add_argument(
         "--api-key", default=None,
         help="Semantic Scholar API key (or set SS_API_KEY env var)."
     )
@@ -191,10 +196,11 @@ def main() -> None:
     if args.api_key:
         configure_api_key(args.api_key)
     input_stem = Path(args.input).stem
+    config_stem = f"_{Path(args.config).stem}" if args.config else ""
     suffix = "_semantic" if args.semantic_only else ""
-    output = args.output or f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{input_stem}_{args.days}d{suffix}_output.txt"
+    output = args.output or f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{input_stem}_{args.days}d{config_stem}{suffix}_output.txt"
     run_pipeline(args.input, args.days, output, enrich=not args.no_enrich,
-                 semantic_only=args.semantic_only)
+                 semantic_only=args.semantic_only, config_path=args.config)
 
 
 if __name__ == "__main__":

@@ -440,11 +440,12 @@ DEFAULT_CATEGORIES = ["cs.LG", "cs.DB", "stat.ML", "cs.AI"]
 _DEFAULT_CONFIG = Path(__file__).parent / "config.yaml"
 
 
-def _build_search_query() -> str:
+def _build_search_query(config_path: str | None = None) -> str:
     """Build search query from keywords list in config.yaml."""
+    cfg_path = Path(config_path) if config_path else _DEFAULT_CONFIG
     keywords: list[str] = []
-    if _DEFAULT_CONFIG.exists():
-        with open(_DEFAULT_CONFIG, "r", encoding="utf-8") as f:
+    if cfg_path.exists():
+        with open(cfg_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         keywords = data.get("keywords") or []
     query = " | ".join(keywords) if keywords else "machine learning"
@@ -459,9 +460,9 @@ _SEARCH_FIELDS = (
 )
 
 
-def _search_recent(hours: int) -> list[dict]:
+def _search_recent(hours: int, config_path: str | None = None) -> list[dict]:
     """Discover papers via SS bulk keyword search with date filter."""
-    query = _build_search_query()
+    query = _build_search_query(config_path)
     cutoff = (datetime.now(tz=timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d")
 
     params: dict = {
@@ -654,6 +655,7 @@ def _fetch_target_author_papers(seed_papers: list[dict], hours: int) -> list[dic
 def fetch_recent_papers(
     seed_papers: list[dict],
     hours: int = 24,
+    config_path: str | None = None,
 ) -> list[dict]:
     """
     Discover recent papers via three channels:
@@ -666,7 +668,7 @@ def fetch_recent_papers(
     # The shared _rate_limiter serialises HTTP calls to respect the API
     # rate limit, while threads overlap I/O wait with result processing.
     with ThreadPoolExecutor(max_workers=3, thread_name_prefix="discovery") as pool:
-        f_search = pool.submit(_search_recent, hours)
+        f_search = pool.submit(_search_recent, hours, config_path)
         f_cite   = pool.submit(_fetch_recent_citers, seed_papers, hours)
         f_author = pool.submit(_fetch_target_author_papers, seed_papers, hours)
 
